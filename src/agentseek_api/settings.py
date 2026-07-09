@@ -38,5 +38,7 @@ class Settings(BaseSettings):
     SEEKDB_EMBED: bool = False
     SEEKDB_EMBED_DIR: str = ""
 
+    WORKER_CONCURRENT_JOBS: int = 10
+
 
 settings = Settings()

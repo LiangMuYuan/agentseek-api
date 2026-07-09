@@ -176,8 +176,6 @@ class DatabaseManager:
             embed_conn_args = {"path": embed_dir, "db_name": settings.OCEANBASE_DB_NAME}
             self._checkpointer = OceanBaseCheckpointSaver(
                 connection_args=embed_conn_args,
-                pool_pre_ping=True,
-                pool_recycle=1800,
             )
             self._langgraph_checkpointer = LangGraphOceanBaseCheckpointSaver(
                 connection_args=embed_conn_args,
@@ -198,7 +196,7 @@ class DatabaseManager:
                 configured_backend=settings.METADATA_DB_BACKEND,
                 url_drivername=parsed_url.drivername,
             )
-            self.engine = create_async_engine(metadata_db_url, pool_pre_ping=True, pool_recycle=1800)
+            self.engine = create_async_engine(metadata_db_url, pool_pre_ping=True, pool_recycle=1800, pool_size=10, max_overflow=5)
             self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
             async with self.engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
@@ -206,8 +204,6 @@ class DatabaseManager:
             conn_args = _resolve_connection_args()
             self._checkpointer = OceanBaseCheckpointSaver(
                 connection_args=conn_args,
-                pool_pre_ping=True,
-                pool_recycle=1800,
             )
             if metadata_backend == "sqlite":
                 self._langgraph_checkpointer = InMemorySaver()

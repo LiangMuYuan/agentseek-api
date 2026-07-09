@@ -39,6 +39,7 @@ async def run_worker(
     await db_manager.initialize()
     run_queue = queue or RedisRunQueue()
     processed = 0
+    processed_lock = asyncio.Lock()
     worker_id = str(uuid4())
     worker_lock_ttl_seconds = settings.REDIS_WORKER_LOCK_TTL_SECONDS
     lock_lost = asyncio.Event()
@@ -47,6 +48,9 @@ async def run_worker(
     acquired_lock = False
     registered_signals: list[signal.Signals] = []
     loop = asyncio.get_running_loop()
+    concurrency = max(1, settings.WORKER_CONCURRENT_JOBS)
+    semaphore = asyncio.Semaphore(concurrency)
+    active_tasks: set[asyncio.Task] = set()
 
     try:
         for signum in (signal.SIGINT, signal.SIGTERM):
@@ -68,19 +72,66 @@ async def run_worker(
         )
         await run_queue.requeue_inflight()
         timeout_seconds = poll_timeout_seconds if poll_timeout_seconds is not None else settings.REDIS_WORKER_POLL_TIMEOUT_SECONDS
-        while not stop_requested.is_set() and (stop_after_jobs is None or processed < stop_after_jobs):
+
+        while not stop_requested.is_set():
             if lock_lost.is_set():
                 raise RuntimeError("Redis worker lost its active lease.")
-            reserved = await run_queue.reserve(timeout_seconds=timeout_seconds)
-            if reserved is None:
-                continue
-            job, token = reserved
-            await execute_run_job(job)
-            if lock_lost.is_set():
-                raise RuntimeError("Redis worker lost its active lease.")
-            await run_queue.ack(token)
-            processed += 1
+
+            # Fill up to concurrency if jobs are available
+            while len(active_tasks) < concurrency:
+                if stop_after_jobs is not None:
+                    async with processed_lock:
+                        if processed >= stop_after_jobs:
+                            break
+                    # re-check outside lock
+                    if processed >= stop_after_jobs:
+                        break
+
+                reserved = await run_queue.reserve(timeout_seconds=timeout_seconds)
+                if reserved is None:
+                    # No more jobs right now, exit filling loop
+                    break
+
+                job, token = reserved
+
+                async def _run_job(job: object, token: str) -> int:
+                    async with semaphore:
+                        if lock_lost.is_set():
+                            raise RuntimeError("Redis worker lost its active lease.")
+                        await execute_run_job(job)
+                        if lock_lost.is_set():
+                            raise RuntimeError("Redis worker lost its active lease.")
+                        await run_queue.ack(token)
+                    async with processed_lock:
+                        nonlocal processed
+                        processed += 1
+                        return processed
+
+                task = asyncio.create_task(_run_job(job, token))
+                active_tasks.add(task)
+                task.add_done_callback(active_tasks.discard)
+
+            if stop_after_jobs is not None:
+                async with processed_lock:
+                    if processed >= stop_after_jobs:
+                        break
+
+            # If nothing is running and no jobs available, brief pause
+            if not active_tasks:
+                await asyncio.sleep(0.1)
+
+    except asyncio.CancelledError:
+        raise
     finally:
+        # Wait for in-flight tasks to finish on shutdown
+        if active_tasks:
+            wait_secs = min(30, worker_lock_ttl_seconds)
+            done, pending = await asyncio.wait(active_tasks, timeout=wait_secs)
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.wait(pending)
+
         for signum in registered_signals:
             loop.remove_signal_handler(signum)
         if heartbeat_task is not None:

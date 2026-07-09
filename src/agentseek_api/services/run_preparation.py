@@ -191,6 +191,25 @@ async def _prepare_run(
             run_context = effective_kwargs.get("context") or {}
             effective_kwargs["context"] = {**assistant_context, **run_context}
             kwargs = effective_kwargs
+        # Merge assistant-level config as defaults into run kwargs
+        # LangGraph AI Studio stores context fields in assistant.config (not context),
+        # so we need to merge config_json into kwargs["config"] as well.
+        # Deep merge at configurable level: assistant defaults + user overrides
+        assistant_config = assistant.config_json or {}
+        if assistant_config:
+            effective_kwargs = dict(kwargs) if kwargs else {}
+            run_config = effective_kwargs.get("config") or {}
+            assistant_cfg = assistant_config.get("configurable", {})
+            run_cfg = run_config.get("configurable", {})
+            merged_configurable = {**assistant_cfg, **run_cfg}
+            merged = {"configurable": merged_configurable}
+            # Carry over other top-level keys (e.g. recursion_limit)
+            for d in (assistant_config, run_config):
+                for k, v in d.items():
+                    if k != "configurable":
+                        merged[k] = v
+            effective_kwargs["config"] = merged
+            kwargs = effective_kwargs
         if thread.metadata_json.get("graph_id") != graph_id:
             thread.metadata_json = {**thread.metadata_json, "graph_id": graph_id}
         claimed_at = datetime.now(UTC)

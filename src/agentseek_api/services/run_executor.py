@@ -186,15 +186,16 @@ def _protocol_role_for_message(message: BaseMessage) -> str | None:
     return None
 
 
-def _build_entry_graph(entry: Any, *, checkpointer: Any, store: Any) -> Any:
+def _build_entry_graph(entry: Any, *, checkpointer: Any, store: Any,
+                       user_configurable: dict[str, Any] | None = None) -> Any:
     build_graph = entry.build_graph
     signature = inspect.signature(build_graph)
     parameters = list(signature.parameters.values())
     has_var_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters)
     has_store = any(parameter.name == "store" for parameter in parameters)
     if has_var_kwargs or has_store:
-        return build_graph(checkpointer, store=store)
-    return build_graph(checkpointer)
+        return build_graph(checkpointer, store=store, user_configurable=user_configurable)
+    return build_graph(checkpointer, user_configurable=user_configurable)
 
 
 def _get_schema_fields(schema: type) -> set[str] | None:
@@ -833,14 +834,22 @@ async def execute_run(
     ensure_sync_checkpoint_mode(requested_async=False)
     entry = get_langgraph_service().get_entry(graph_id)
     runtime_store = UserScopedStore(db_manager.get_store(), user_id=user_id)
+
+    run_kwargs = kwargs or {}
+    user_config = dict(run_kwargs.get("config", {})) if isinstance(run_kwargs.get("config"), dict) else {}
+    user_configurable = dict(user_config.get(CONF, {})) if isinstance(user_config.get(CONF), dict) else {}
+    # Fallback: if config is empty, try context (users may pass fields via "context" not "config")
+    if not user_configurable:
+        user_context = run_kwargs.get("context") or {}
+        if isinstance(user_context, dict):
+            user_configurable = dict(user_context)
     graph = _build_entry_graph(
         entry,
         checkpointer=db_manager.get_langgraph_checkpointer(),
         store=runtime_store,
+        user_configurable=user_configurable,
     )
 
-    run_kwargs = kwargs or {}
-    user_config = dict(run_kwargs.get("config", {})) if isinstance(run_kwargs.get("config"), dict) else {}
     config = dict(user_config)
     graph_bound_config = getattr(graph, "config", None) or {}
     if "recursion_limit" not in config and "recursion_limit" in graph_bound_config:

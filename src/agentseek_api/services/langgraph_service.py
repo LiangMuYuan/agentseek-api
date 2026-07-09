@@ -145,6 +145,7 @@ def _build_graph_from_definition(
     graph_definition: GraphFactory,
     checkpointer: Any | None,
     store: Any | None,
+    user_configurable: dict[str, Any] | None = None,
 ) -> Pregel:
     if isinstance(graph_definition, Pregel):
         return graph_definition
@@ -167,7 +168,10 @@ def _build_graph_from_definition(
             graph_kwargs["store"] = store
         built = graph_definition(**graph_kwargs)
     else:
-        built = graph_definition(_build_factory_config(checkpointer=checkpointer, store=store))
+        factory_config = _build_factory_config(checkpointer=checkpointer, store=store)
+        if user_configurable:
+            factory_config[CONF] = {**user_configurable, **factory_config[CONF]}
+        built = graph_definition(factory_config)
     return _coerce_graph(built, checkpointer=checkpointer, store=store)
 
 
@@ -211,8 +215,9 @@ class GraphEntry:
     input_schema: dict[str, Any] = field(default_factory=lambda: {"type": "object"})
     output_schema: dict[str, Any] = field(default_factory=lambda: {"type": "object"})
 
-    def build_graph(self, checkpointer: Any | None = None, store: Any | None = None) -> Pregel:
-        return _build_graph_from_definition(self.graph_factory, checkpointer, store)
+    def build_graph(self, checkpointer: Any | None = None, store: Any | None = None,
+                     user_configurable: dict[str, Any] | None = None) -> Pregel:
+        return _build_graph_from_definition(self.graph_factory, checkpointer, store, user_configurable)
 
 
 class LangGraphService:

@@ -168,22 +168,28 @@ class DatabaseManager:
             await asyncio.to_thread(_ensure_embed_database, embed_dir, db_name)
             metadata_db_path = os.path.join(embed_dir, "metadata.db")
             metadata_db_url = f"sqlite+aiosqlite:///{metadata_db_path}"
-            self.engine = create_async_engine(metadata_db_url, pool_pre_ping=False)
+            self.engine = create_async_engine(metadata_db_url, pool_pre_ping=True, pool_recycle=1800)
             self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
             async with self.engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
                 await conn.run_sync(self._apply_additive_migrations)
             embed_conn_args = {"path": embed_dir, "db_name": settings.OCEANBASE_DB_NAME}
             self._checkpointer = OceanBaseCheckpointSaver(
-                connection_args=embed_conn_args
+                connection_args=embed_conn_args,
+                pool_pre_ping=True,
+                pool_recycle=1800,
             )
             self._langgraph_checkpointer = LangGraphOceanBaseCheckpointSaver(
-                connection_args=embed_conn_args
+                connection_args=embed_conn_args,
+                pool_pre_ping=True,
+                pool_recycle=1800,
             )
             self._store = OceanBaseStore(
                 connection_args=embed_conn_args,
                 index=runtime_index,
                 ttl_config=runtime_ttl,
+                pool_pre_ping=True,
+                pool_recycle=1800,
             )
         else:
             metadata_db_url = resolve_metadata_db_url()
@@ -192,14 +198,16 @@ class DatabaseManager:
                 configured_backend=settings.METADATA_DB_BACKEND,
                 url_drivername=parsed_url.drivername,
             )
-            self.engine = create_async_engine(metadata_db_url, pool_pre_ping=metadata_backend != "mysql")
+            self.engine = create_async_engine(metadata_db_url, pool_pre_ping=True, pool_recycle=1800)
             self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
             async with self.engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
                 await conn.run_sync(self._apply_additive_migrations)
             conn_args = _resolve_connection_args()
             self._checkpointer = OceanBaseCheckpointSaver(
-                connection_args=conn_args
+                connection_args=conn_args,
+                pool_pre_ping=True,
+                pool_recycle=1800,
             )
             if metadata_backend == "sqlite":
                 self._langgraph_checkpointer = InMemorySaver()
@@ -210,12 +218,16 @@ class DatabaseManager:
                 )
             else:
                 self._langgraph_checkpointer = LangGraphOceanBaseCheckpointSaver(
-                    connection_args=conn_args
+                    connection_args=conn_args,
+                    pool_pre_ping=True,
+                    pool_recycle=1800,
                 )
                 self._store = OceanBaseStore(
                     connection_args=conn_args,
                     index=runtime_index,
                     ttl_config=runtime_ttl,
+                    pool_pre_ping=True,
+                    pool_recycle=1800,
                 )
 
         await self._setup_checkpointer_once()

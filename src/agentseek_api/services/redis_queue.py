@@ -3,18 +3,19 @@ from __future__ import annotations
 import json
 
 from redis.asyncio import Redis, from_url
+from redis.exceptions import TimeoutError
 
 from agentseek_api.services.run_jobs import RunExecutionJob
 from agentseek_api.settings import settings
 
-_RENEW_WORKER_LOCK_SCRIPT = """
+_RENEW_LOCK_SCRIPT = """
 if redis.call("GET", KEYS[1]) == ARGV[1] then
   return redis.call("EXPIRE", KEYS[1], tonumber(ARGV[2]))
 end
 return 0
 """
 
-_RELEASE_WORKER_LOCK_SCRIPT = """
+_RELEASE_LOCK_SCRIPT = """
 if redis.call("GET", KEYS[1]) == ARGV[1] then
   return redis.call("DEL", KEYS[1])
 end
@@ -32,21 +33,30 @@ class RedisRunQueue:
         worker_lock_key: str | None = None,
         scheduler_lock_key: str | None = None,
     ) -> None:
-        self.client = client or from_url(settings.REDIS_URL, decode_responses=True)
+        self.client = client or from_url(
+            settings.REDIS_URL,
+            decode_responses=True,
+            socket_timeout=10,
+            socket_connect_timeout=5,
+        )
         self.queue_key = queue_key or settings.REDIS_RUN_QUEUE_KEY
         self.processing_key = processing_key or settings.REDIS_RUN_PROCESSING_KEY
         self.worker_lock_key = worker_lock_key or settings.REDIS_WORKER_LOCK_KEY
         self.scheduler_lock_key = scheduler_lock_key or settings.REDIS_SCHEDULER_LOCK_KEY
+        self._startup_lock_key = f"{self.worker_lock_key}:startup"
 
     async def enqueue(self, job: RunExecutionJob) -> None:
         await self.client.lpush(self.queue_key, self._serialize(job))
 
     async def reserve(self, *, timeout_seconds: int) -> tuple[RunExecutionJob, str] | None:
-        raw = await self.client.brpoplpush(self.queue_key, self.processing_key, timeout=timeout_seconds)
-        if raw is None:
+        try:
+            raw = await self.client.brpoplpush(self.queue_key, self.processing_key, timeout=timeout_seconds)
+            if raw is None:
+                return None
+            payload = json.loads(raw)
+            return RunExecutionJob.from_payload(payload), raw
+        except TimeoutError:
             return None
-        payload = json.loads(raw)
-        return RunExecutionJob.from_payload(payload), raw
 
     async def ack(self, token: str) -> None:
         await self.client.lrem(self.processing_key, 1, token)
@@ -57,7 +67,7 @@ class RedisRunQueue:
             for raw in items:
                 try:
                     payload = json.loads(raw)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     continue
                 if str(payload.get("run_id", "")) == run_id:
                     return True
@@ -71,13 +81,17 @@ class RedisRunQueue:
                 return moved
             moved += 1
 
+    async def acquire_startup_lock(self, *, ttl_seconds: int) -> bool:
+        acquired = await self.client.set(self._startup_lock_key, "1", ex=ttl_seconds, nx=True)
+        return bool(acquired)
+
     async def acquire_lease(self, lease_key: str, owner_id: str, *, ttl_seconds: int) -> bool:
         acquired = await self.client.set(lease_key, owner_id, ex=ttl_seconds, nx=True)
         return bool(acquired)
 
     async def renew_lease(self, lease_key: str, owner_id: str, *, ttl_seconds: int) -> bool:
         renewed = await self.client.eval(
-            _RENEW_WORKER_LOCK_SCRIPT,
+            _RENEW_LOCK_SCRIPT,
             1,
             lease_key,
             owner_id,
@@ -87,7 +101,7 @@ class RedisRunQueue:
 
     async def release_lease(self, lease_key: str, owner_id: str) -> None:
         await self.client.eval(
-            _RELEASE_WORKER_LOCK_SCRIPT,
+            _RELEASE_LOCK_SCRIPT,
             1,
             lease_key,
             owner_id,

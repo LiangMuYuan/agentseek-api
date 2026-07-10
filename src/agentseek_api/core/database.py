@@ -9,6 +9,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langchain_oceanbase.checkpointer import OceanBaseCheckpointSaver as LangGraphOceanBaseCheckpointSaver
 from langchain_oceanbase.store import OceanBaseStore
 from sqlalchemy.engine import URL, make_url
+from sqlalchemy import event as sa_event
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from agentseek_api.core.oceanbase_checkpointer import OceanBaseCheckpointSaver
@@ -197,6 +198,17 @@ class DatabaseManager:
                 url_drivername=parsed_url.drivername,
             )
             self.engine = create_async_engine(metadata_db_url, pool_pre_ping=True, pool_recycle=1800, pool_size=10, max_overflow=5)
+
+            # OceanBase 默认 ob_query_timeout=10s，大 payload INSERT 可能超时
+            if metadata_backend == "mysql":
+
+                @sa_event.listens_for(self.engine.sync_engine, "connect")
+                def _set_ob_query_timeout(dbapi_connection, connection_record):  # noqa: F811
+                    cursor = dbapi_connection.cursor()
+                    cursor.execute("SET SESSION ob_query_timeout = 600000000")  # 600s = 10min
+                    cursor.close()
+                    logger.debug("ob_query_timeout set to 600s on new connection")
+
             self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
             async with self.engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)

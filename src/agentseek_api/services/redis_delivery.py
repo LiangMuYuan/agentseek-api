@@ -50,12 +50,18 @@ async def _deliver(operation_id):
     from agentseek_api.services.stream_persistence import append_redis_envelope, expire_redis_envelope
 
     async def deliver(session):
+        # Acquire the write lock before loading ORM state. SQLite ignores
+        # SELECT FOR UPDATE: a producer/reconciler may otherwise retain an old
+        # row after another dispatcher acknowledges or removes it. That can
+        # cause StaleDataError or reappend a delivered envelope after expiry.
+        locked = await session.execute(update(StreamDelivery).where(
+            StreamDelivery.operation_id == operation_id).values(operation_id=operation_id))
+        if locked.rowcount == 0:
+            return None
         row = await session.scalar(select(StreamDelivery).where(
             StreamDelivery.operation_id == operation_id).with_for_update())
         if row is None:
             return None
-        await session.execute(update(StreamDelivery).where(
-            StreamDelivery.operation_id == operation_id).values(operation_id=operation_id))
         envelopes = [dict(scope=scope, stream_id=identity, operation_id=f"{operation_id}:{scope}", payload=row.payload)
                      for scope, identity in (("run", row.run_id), ("thread", row.thread_id))]
         if row.run_bound:

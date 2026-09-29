@@ -205,6 +205,58 @@ async def test_pending_protocol_delivery_does_not_resurrect_deleted_run(run_stor
         if keys:
             await redis.delete(*keys)
         await redis.aclose()
+
+
+@pytest.mark.parametrize("cleanup", ["deleted", "acknowledged"])
+async def test_delivery_reloads_after_competing_dispatcher_wins(run_storage, monkeypatch, cleanup):
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.sql.dml import Update
+    from agentseek_api.core.orm import StreamDelivery
+    from agentseek_api.services import redis_delivery
+
+    redis = from_url(_TEST_REDIS_URL, decode_responses=True)
+    identity = uuid4().hex
+    monkeypatch.setattr(stream_module, "_redis_client", redis)
+    async with run_storage() as session:
+        session.add(StreamDelivery(operation_id=identity, run_id=identity, thread_id=identity,
+            run_bound=False, payload={"method": "values", "params": {"data": ["once"]}}))
+        await session.commit()
+
+    if cleanup == "acknowledged":
+        async def fail_expiry(**kwargs):
+            raise RuntimeError("cleanup temporarily unavailable")
+        monkeypatch.setattr(stream_module, "expire_redis_envelope", fail_expiry)
+
+    execute = AsyncSession.execute
+    raced = False
+    winner = None
+
+    async def complete_competitor_before_lock(session, statement, *args, **kwargs):
+        nonlocal raced, winner
+        if not raced and isinstance(statement, Update) and statement.table.name == "stream_deliveries":
+            raced = True
+            winner = await redis_delivery._deliver(identity)
+            if cleanup == "acknowledged":
+                # SQL acknowledgment must prevent reappend even after expiry.
+                markers = await redis.keys(f"*{identity}*:op:*")
+                assert markers
+                await redis.delete(*markers)
+        return await execute(session, statement, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "execute", complete_competitor_before_lock)
+    try:
+        observed = await redis_delivery._deliver(identity)
+        assert raced and winner is not None
+        assert observed == (None if cleanup == "deleted" else winner)
+        assert await redis.xlen(stream_module._run_stream_key(identity)) == 1
+        assert await redis.xlen(stream_module._thread_stream_key(identity)) == 1
+    finally:
+        keys = await redis.keys(f"*{identity}*")
+        if keys:
+            await redis.delete(*keys)
+        await redis.aclose()
+
+
 @pytest.mark.parametrize("race", ["delete", "resume"])
 async def test_terminal_marker_cleanup_survives_run_replacement(run_storage, monkeypatch, race):
     from agentseek_api.core.orm import Run

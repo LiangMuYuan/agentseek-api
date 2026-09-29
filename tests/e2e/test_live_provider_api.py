@@ -233,9 +233,19 @@ async def test_live_provider_create_time_wait_and_stream_match_langgraph_contrac
         assert joined_stream.status_code == 200
         joined_events = parse_sse_events(joined_stream.text)
         joined_event_names = [event["event"] for event in joined_events]
-        assert joined_event_names == ["metadata"]
+        assert joined_event_names == ["metadata", "end"]
+        end = joined_events[-1]
+        assert end["data"] == {}
+        assert end["id"] == next(event["id"] for event in events if event["event"] == "end")
         assert "start" not in joined_event_names
         assert "message_chunk" not in joined_event_names
+
+        reconnected = await client.get(
+            streamed_create.headers["location"],
+            headers={**user_headers(user_id), "Last-Event-ID": end["id"]},
+        )
+        assert reconnected.status_code == 200
+        assert parse_sse_events(reconnected.text) == []
 
 
 @pytest.mark.e2e

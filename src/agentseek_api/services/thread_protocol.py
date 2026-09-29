@@ -282,8 +282,11 @@ async def _apublish_thread_event(thread_id: str, payload: dict[str, Any]) -> dic
     run_id = (payload.get("params") or {}).get("run_id")
     if settings.EXECUTOR_BACKEND.strip().lower() == "redis":
         if run_id:
-            run_record, thread_record = await persistence.append_redis_protocol_event(
+            records = await persistence.append_redis_protocol_event(
                 operation_id=str(uuid4()), run_id=run_id, thread_id=thread_id, payload=payload)
+            if not records:
+                return dict(payload)  # Cancelled/deleted generations are deliberately dropped.
+            run_record, thread_record = records
             # Required dual writes are complete before either notification.
             run_broker.publish_protocol(run_id, run_record[1], seq=run_record[0])
             seq, saved = thread_record

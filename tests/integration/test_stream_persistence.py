@@ -590,7 +590,7 @@ def test_redis_create_run_stream_replays_tool_message_tuple_for_sdk_subscribers(
     monkeypatch.setattr(stream_module, "_redis_client", fake_redis)
     monkeypatch.setattr(runs_api, "REDIS_STREAM_POLL_INTERVAL_SECONDS", 0)
 
-    thread_id, run_id = client.portal.call(lambda: _seed_run(status="success"))
+    thread_id, run_id = client.portal.call(lambda: _seed_run(status="running"))
     created = RunRead(
         run_id=run_id,
         thread_id=thread_id,
@@ -641,6 +641,13 @@ def test_redis_create_run_stream_replays_tool_message_tuple_for_sdk_subscribers(
     )
     thread_protocol_broker.delete_thread(thread_id)
 
+    async def complete_run():
+        async with db_manager.get_session_factory()() as session:
+            row = await session.get(Run, run_id)
+            row.status = "success"
+            await session.commit()
+    client.portal.call(complete_run)
+
     response = runs_api._build_create_run_stream_response(
         thread_id=thread_id,
         created=created,
@@ -658,6 +665,15 @@ def test_redis_create_run_stream_replays_tool_message_tuple_for_sdk_subscribers(
     events = _parse_sse(body)
     assert [event["event"] for event in events] == ["metadata", "messages"]
     assert events[1]["data"] == [tool_message, metadata]
+
+
+def test_redis_protocol_publication_after_cancellation_is_ignored(client, monkeypatch):
+    monkeypatch.setattr(stream_module.settings, "EXECUTOR_BACKEND", "redis")
+    monkeypatch.setattr(stream_module, "_redis_client", FakeRedisCounter())
+    thread_id, run_id = client.portal.call(lambda: _seed_run(status="error"))
+    client.portal.call(lambda: apublish_messages_complete(
+        thread_id, messages=[{"id": "late", "content": "late"}], run_id=run_id))
+    assert client.portal.call(stream_module.load_run_stream_events, run_id) == []
 
 
 def test_run_stream_persistence_uses_shared_seq_after_broker_reset(client: TestClient, monkeypatch) -> None:

@@ -16,6 +16,47 @@ from agentseek_api.services.thread_protocol import ThreadProtocolEventBroker
 pytestmark = pytest.mark.usefixtures("run_storage")
 
 
+@pytest.mark.parametrize("events", [False, True])
+async def test_idless_model_invocations_are_normalized_without_mutation(monkeypatch, events):
+    from langchain_core.outputs import ChatGenerationChunk
+    from agentseek_api.services import thread_protocol
+    messages = [AIMessageChunk(content=text) for text in ["a", "x", "b", "y", "c", "q", "r"]]
+    calls = ["model-a", "model-b", "model-a", "model-b", "model-a", "model-c", "model-c"]
+    class Graph(FakeGraph):
+        async def astream(self, prepared_input, config, **kwargs):
+            for message, call in zip(messages, calls, strict=True):
+                for handler in config.get("callbacks", []):
+                    handler.on_llm_new_token(message.content, chunk=ChatGenerationChunk(message=message), run_id=call)
+                yield "messages", (message, {"langgraph_node": "model", "langgraph_step": 1})
+            yield "values", {"messages": []}
+        async def astream_events(self, prepared_input, config, **kwargs):
+            for message, call in zip(messages, calls, strict=True):
+                yield {"event": "on_chat_model_stream", "run_id": call, "parent_ids": ["root"],
+                       "metadata": {"langgraph_node": "model", "langgraph_step": 1}, "data": {"chunk": message}}
+            yield {"event": "on_chain_end", "run_id": "root", "parent_ids": [], "data": {"output": {"messages": []}}}
+    graph = Graph()
+    class Entry(FakeEntry):
+        @staticmethod
+        def build_graph(_checkpointer=None, store=None):
+            return graph
+    monkeypatch.setattr("agentseek_api.services.run_executor.get_langgraph_service", lambda: SimpleNamespace(get_entry=lambda _: Entry()))
+    monkeypatch.setattr("agentseek_api.services.run_executor.db_manager", FakeDBManager())
+    await execute_run(thread_id="t1", run_id="r1", payload={}, user_id="u1",
+                      kwargs={"stream_modes": ["messages-tuple"] + (["events"] if events else [])})
+    records = thread_protocol.thread_protocol_broker.snapshot_records("t1")
+    metadata = [r["params"]["data"] for r in records if r["method"] == "messages/metadata"]
+    assert len(metadata) == 3
+    partials = [r["params"]["data"][0] for r in records if r["method"] == "messages/partial"]
+    by_id = {m["id"]: m["content"] for m in partials}
+    assert sorted(by_id.values()) == ["abc", "qr", "xy"]
+    assert all(m["id"] for m in partials)
+    tuples = [r["params"]["data"][0] for r in records if r["method"] == "messages-tuple"]
+    assert {m["id"] for m in tuples} == set(by_id)
+    complete = [m for r in records if r["method"] == "messages/complete" for m in r["params"]["data"]]
+    assert {m["id"]: m["content"] for m in complete} == by_id
+    assert all(message.id is None for message in messages)
+
+
 class FakeGraph:
     """Fake compiled graph: the default path streams through ``astream()`` and
     then reads the final state back via ``aget_state()``, mirroring how
@@ -342,8 +383,8 @@ async def test_execute_run_keeps_interrupt_in_updates_when_updates_requested(mon
 class FakeProtocolStreamingGraph(FakeGraph):
     async def astream(self, prepared_input: dict, config: dict, **kwargs):
         self.configs.append(config)
-        yield ("messages", (AIMessageChunk(content="hel"), {"langgraph_node": "call_model"}))
-        yield ("messages", (AIMessageChunk(content="lo"), {"langgraph_node": "call_model"}))
+        yield ("messages", (AIMessageChunk(content="hel"), {"langgraph_node": "call_model", "model_invocation_id": "fake-model-call"}))
+        yield ("messages", (AIMessageChunk(content="lo"), {"langgraph_node": "call_model", "model_invocation_id": "fake-model-call"}))
         yield ("updates", {"step": "partial"})
         yield ("values", {"output": {"messages": [AIMessage(content="hello")], "step": "final"}})
 
@@ -351,8 +392,8 @@ class FakeProtocolStreamingGraph(FakeGraph):
 class FakeProtocolLlmStreamingGraph(FakeGraph):
     async def astream(self, prepared_input: dict, config: dict, **kwargs):
         self.configs.append(config)
-        yield ("messages", (AIMessageChunk(content="hel"), {"langgraph_node": "call_model"}))
-        yield ("messages", (AIMessageChunk(content="lo"), {"langgraph_node": "call_model"}))
+        yield ("messages", (AIMessageChunk(content="hel"), {"langgraph_node": "call_model", "model_invocation_id": "fake-model-call"}))
+        yield ("messages", (AIMessageChunk(content="lo"), {"langgraph_node": "call_model", "model_invocation_id": "fake-model-call"}))
         yield ("values", {"output": {"text": "hello"}})
 
 
@@ -365,7 +406,7 @@ class FakeProtocolNamespaceGraph(FakeGraph):
         yield (
             ["node_1:task-1", "call_model:task-3"],
             "messages",
-            (AIMessageChunk(content="hello"), {"langgraph_node": "call_model"}),
+            (AIMessageChunk(content="hello"), {"langgraph_node": "call_model", "model_invocation_id": "fake-model-call"}),
         )
         yield (["node_1:task-1"], "updates", {"step": "partial"})
         yield ([], "values", {"output": {"messages": [AIMessage(content="hello")], "step": "final"}})
@@ -383,7 +424,7 @@ class FakeProtocolStructuredMessageGraph(FakeGraph):
                         {"type": "reasoning", "summary": [{"type": "summary_text", "text": "why"}]},
                     ]
                 ),
-                {"langgraph_node": "call_model"},
+                {"langgraph_node": "call_model", "model_invocation_id": "fake-model-call"},
             ),
         )
         yield (
@@ -416,7 +457,7 @@ class FakeProtocolToolCallChunkGraph(FakeGraph):
                         {"id": "call-1", "name": "search", "args": '{"q":"hel"}', "index": 0},
                     ],
                 ),
-                {"langgraph_node": "call_model"},
+                {"langgraph_node": "call_model", "model_invocation_id": "fake-model-call"},
             ),
         )
         yield (
@@ -428,7 +469,7 @@ class FakeProtocolToolCallChunkGraph(FakeGraph):
                         {"id": "call-1", "name": None, "args": 'lo"}', "index": 0},
                     ],
                 ),
-                {"langgraph_node": "call_model"},
+                {"langgraph_node": "call_model", "model_invocation_id": "fake-model-call"},
             ),
         )
         yield ("values", {"output": {"messages": []}})
@@ -437,7 +478,7 @@ class FakeProtocolToolCallChunkGraph(FakeGraph):
 class FakeProtocolMixedStructuredGraph(FakeGraph):
     async def astream(self, prepared_input: dict, config: dict, **kwargs):
         self.configs.append(config)
-        yield ("messages", (AIMessageChunk(content="hello"), {"langgraph_node": "call_model"}))
+        yield ("messages", (AIMessageChunk(content="hello"), {"langgraph_node": "call_model", "model_invocation_id": "fake-model-call"}))
         yield (
             "values",
             {
@@ -506,7 +547,7 @@ class FakeProtocolToolMessageGraph(FakeGraph):
         yield (
             ["call_model:task-3"],
             "messages",
-            (AIMessageChunk(content="Final answer", id="ai-message-1"), {"langgraph_node": "call_model"}),
+            (AIMessageChunk(content="Final answer", id="ai-message-1"), {"langgraph_node": "call_model", "model_invocation_id": "fake-model-call"}),
         )
         yield (
             [],
@@ -660,7 +701,7 @@ async def test_execute_run_mirrors_tool_message_to_requested_tuple_stream_once_a
         stream_modes=["messages-tuple", "values"],
         stream_subgraphs=True,
     )
-    complete_events = [event for event in thread_events if event["method"] == "messages/complete"]
+    complete_events = [event for event in thread_events if event["method"] == "messages/complete" and event["params"]["data"][0]["type"] == "tool"]
     tuple_events = [event for event in thread_events if event["method"] == "messages-tuple"]
     tool_tuples = [event for event in tuple_events if event["params"]["data"][0]["type"] == "tool"]
 
@@ -694,7 +735,7 @@ async def test_execute_run_keeps_tool_message_complete_without_unrequested_tuple
     thread_events = await _run_fake_graph(
         monkeypatch, FakeProtocolToolMessageGraph(), stream_modes=["values"], stream_subgraphs=True
     )
-    complete_events = [event for event in thread_events if event["method"] == "messages/complete"]
+    complete_events = [event for event in thread_events if event["method"] == "messages/complete" and event["params"]["data"][0]["type"] == "tool"]
     tuple_events = [event for event in thread_events if event["method"] == "messages-tuple"]
 
     assert len(complete_events) == 1
@@ -784,7 +825,7 @@ class FakeAstreamEventsGraph(FakeGraph):
         yield {
             "event": "on_chat_model_stream",
             "data": {"chunk": AIMessageChunk(content="hi")},
-            "metadata": {"langgraph_node": "call_model"},
+            "metadata": {"langgraph_node": "call_model", "model_invocation_id": "fake-model-call"},
             "parent_ids": [],
         }
         yield {
@@ -1019,8 +1060,8 @@ class FakeParallelIdlessMessagesGraph(FakeGraph):
 
     async def astream(self, prepared_input: dict, config: dict, **kwargs):
         self.configs.append(config)
-        yield (("ns_a:task-1",), "messages", (AIMessageChunk(content="hello", id=None), {"langgraph_node": "ns_a"}))
-        yield (("ns_b:task-1",), "messages", (AIMessageChunk(content="world", id=None), {"langgraph_node": "ns_b"}))
+        yield (("ns_a:task-1",), "messages", (AIMessageChunk(content="hello", id=None), {"langgraph_node": "ns_a", "model_invocation_id": "call-a"}))
+        yield (("ns_b:task-1",), "messages", (AIMessageChunk(content="world", id=None), {"langgraph_node": "ns_b", "model_invocation_id": "call-b"}))
 
     async def aget_state(self, config: dict):
         return SimpleNamespace(values={"output": {"ok": True}})
@@ -1047,5 +1088,4 @@ async def test_execute_run_idless_messages_from_different_namespaces_get_distinc
         for event in metadata_events
     ]
     assert len(message_ids) == len(set(message_ids)), f"id-less message ids collided: {message_ids}"
-    assert any("ns_a" in mid for mid in message_ids)
-    assert any("ns_b" in mid for mid in message_ids)
+    assert [event["params"]["namespace"] for event in metadata_events] == [["ns_a:task-1"], ["ns_b:task-1"]]

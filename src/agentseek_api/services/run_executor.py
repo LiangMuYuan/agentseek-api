@@ -2,6 +2,7 @@ from contextlib import aclosing
 from dataclasses import dataclass, field
 import inspect
 from typing import Any
+from uuid import uuid4
 
 from langchain_core.messages import BaseMessage, BaseMessageChunk
 from langchain_core.messages.utils import message_chunk_to_message
@@ -12,6 +13,7 @@ from agentseek_api.core.database import db_manager
 from agentseek_api.core.runtime_store import UserScopedStore
 from agentseek_api.models.auth import User
 from agentseek_api.services.langgraph_service import ensure_sync_checkpoint_mode, get_langgraph_service
+from agentseek_api.services.message_identity import MessageIdentityTracker, ModelInvocationCallback
 from agentseek_api.services.thread_protocol import (
     apublish_content_block_delta,
     apublish_content_block_finish,
@@ -798,6 +800,11 @@ async def execute_run(
     interrupt_chunk: Any = None
     interrupt_namespace: list[str] | None = None
     protocol_messages = _ProtocolMessageStreamState(thread_id=thread_id, run_id=run_id)
+    message_identities = MessageIdentityTracker()
+    model_invocations = ModelInvocationCallback()
+    model_invocations.attach(config)
+    message_namespaces: dict[str, list[str] | None] = {}
+    completed_message_ids: set[str] = set()
     # Accumulators for the official LangGraph ``messages/partial`` wire format —
     # one accumulated message per id, plus a "metadata seen" set so we only emit
     # ``messages/metadata`` once per message_id.
@@ -844,6 +851,7 @@ async def execute_run(
     async def _publish_complete_messages_from_update(data: dict[str, Any], namespace: list[str] | None) -> None:
         """Emit protocol-v2 events for complete (non-LLM) messages inside a state update."""
         seen: set[str] = set()
+        update_invocation = str(uuid4())
         for value in data.values():
             if not isinstance(value, dict):
                 continue
@@ -866,6 +874,7 @@ async def execute_run(
                     metadata={},
                     namespace=namespace,
                     message_index=message_index,
+                    invocation_id=update_invocation,
                 )
 
     # Shared live-message handler used by both execution paths. Streams the
@@ -878,23 +887,26 @@ async def execute_run(
         metadata: dict[str, Any],
         namespace: list[str] | None,
         message_index: int,
+        invocation_id: str | None = None,
     ) -> None:
         role = _protocol_role_for_message(message)
         blocks = _protocol_blocks_for_message(message)
         if role is None or not blocks:
             return
-        explicit_message_id = getattr(message, "id", None)
-        if isinstance(explicit_message_id, str) and explicit_message_id:
-            message_id = explicit_message_id
-        else:
-            # Id-less streamed message: derive a stable identity from the stream
-            # context. ``message_index`` alone restarts for every yielded stream
-            # event, so two id-less chunks from different subgraph namespaces
-            # would collide on the same fallback id and be merged into one
-            # message by the client. The namespace disambiguates them; within one
-            # namespace the index keeps increments monotonic.
-            ns_suffix = ":".join(namespace) if namespace else ""
-            message_id = f"{run_id}:message:{ns_suffix}{':' if ns_suffix else ''}{message_index}"
+        explicit_message_id = message.id
+        observed = model_invocations.take(message)
+        if observed is not None:
+            invocation_id, explicit_message_id = observed
+        invocation_id = invocation_id or metadata.get("model_invocation_id") or explicit_message_id or ""
+        message_id = message_identities.resolve(
+            invocation_id=str(invocation_id), namespace=tuple(namespace or ()),
+            provider_message_id=explicit_message_id, message_index=message_index,
+            complete=not isinstance(message, BaseMessageChunk),
+        )
+        # Normalize a copy for every wire representation, including tuples and
+        # accumulated partials; never assign an ID to the caller's object.
+        message = message.model_copy(update={"id": message_id})
+        message_namespaces[message_id] = namespace
         await protocol_messages.apublish_blocks(
             message_id=message_id,
             role=role,
@@ -1079,6 +1091,12 @@ async def execute_run(
     # Finalize the protocol message stream and, when no values event was emitted
     # via the stream, publish the final state as a values event.
     async def _finalize_stream(final_result: Any) -> None:
+        for message_id, accumulated in messages_partial_acc.items():
+            if message_id not in completed_message_ids:
+                output_message = message_chunk_to_message(accumulated) if isinstance(accumulated, BaseMessageChunk) else accumulated
+                await apublish_messages_complete(thread_id, messages=[_normalize_stream_value(output_message)],
+                    namespace=message_namespaces[message_id], run_id=run_id)
+                completed_message_ids.add(message_id)
         normalized_result = _normalize_stream_value(final_result)
         if isinstance(normalized_result, dict):
             messages = _extract_protocol_result_messages(normalized_result)
@@ -1121,6 +1139,7 @@ async def execute_run(
                         metadata=stream_event.get("metadata", {}),
                         namespace=protocol_namespace,
                         message_index=message_index,
+                        invocation_id=str(stream_event.get("run_id") or ""),
                     )
                 if raw_event_name == "on_llm_stream":
                     text = _extract_text_chunk(chunk)

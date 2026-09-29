@@ -102,12 +102,9 @@ class ThreadProtocolEventBroker:
         self._mark_active(thread_id)
         if seq is None:
             seq = self._next_seq[thread_id]
-        else:
-            # Never regress below the in-memory watermark: an explicit seq from
-            # persistent state may be lower than what this process has already
-            # handed out (e.g. the broker was cleared and re-seeded from the DB
-            # mid-run). Clamping here keeps the wire seq monotonic.
-            seq = max(seq, self._next_seq[thread_id])
+        for existing in self._events.get(thread_id, []):
+            if existing["seq"] == seq:
+                return dict(existing)
         self._next_seq[thread_id] = max(self._next_seq[thread_id], seq + 1)
         event = {
             "type": "event",
@@ -116,6 +113,7 @@ class ThreadProtocolEventBroker:
             **payload,
         }
         self._events[thread_id].append(event)
+        self._events[thread_id].sort(key=lambda item: item["seq"])
         self._prune_thread_events(thread_id)
         self._signals[thread_id].set()
         return event
@@ -277,6 +275,22 @@ async def _persist_protocol_to_run_stream(run_id: str, payload: dict[str, Any]) 
 
 async def _apublish_thread_event(thread_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     run_id = (payload.get("params") or {}).get("run_id")
+    if settings.EXECUTOR_BACKEND.strip().lower() != "redis":
+        from agentseek_api.services.stream_persistence import buffer_durable_event
+        from agentseek_api.services.run_state import run_broker
+
+        if await buffer_durable_event(
+            "thread", thread_id, payload,
+            lambda seq, saved: thread_protocol_broker.publish(thread_id, saved, persist=False, seq=seq),
+        ):
+            if run_id:
+                # Both records share the same SQL flush. No public sequence
+                # exists until that transaction commits.
+                await buffer_durable_event(
+                    "run", run_id, payload,
+                    lambda seq, saved: run_broker.publish_protocol(run_id, saved, seq=seq),
+                )
+            return dict(payload)
     if run_id:
         await _persist_protocol_to_run_stream(run_id, payload)
     if settings.EXECUTOR_BACKEND.strip().lower() != "redis":

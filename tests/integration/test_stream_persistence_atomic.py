@@ -155,73 +155,14 @@ def test_atomic_append_self_heals_after_counter_row_deleted(client) -> None:
     )
 
 
-@pytest.mark.asyncio
-async def test_atomic_append_resolves_legacy_seq_collision(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A seq collision with an out-of-band row is healed, not dropped.
-
-    ``_db_append`` retries once with a fresh allocation after the unique
-    constraint rejects the insert, so a legacy out-of-band row can never wedge
-    the atomic stream into losing a frame.
-    """
+def test_atomic_append_rejects_explicit_cursor_collision(client) -> None:
+    """A requested cursor must not be silently renumbered or overwrite history."""
     from sqlalchemy.exc import IntegrityError
 
-    class FakeSession:
-        def __init__(self) -> None:
-            self.commit_calls = 0
-            self.rollbacks = 0
-            self.staged: list[tuple[int | None, dict[str, object]]] = []
-            self.persisted: list[tuple[int | None, dict[str, object]]] = []
+    async def exercise():
+        await stream_module.append_run_stream_event_atomic("collision", {"event": "start"})
+        with pytest.raises(IntegrityError):
+            await stream_module.append_run_stream_event_atomic("collision", {"event": "end"}, seq=1)
+        return await stream_module.load_run_stream_events("collision")
 
-        async def __aenter__(self) -> FakeSession:
-            return self
-
-        async def __aexit__(self, *_args: object) -> None:
-            return None
-
-        async def commit(self) -> None:
-            self.commit_calls += 1
-            if self.commit_calls == 1:
-                raise IntegrityError("INSERT", {}, Exception("duplicate seq"))
-            self.persisted = list(self.staged)
-
-        async def rollback(self) -> None:
-            self.rollbacks += 1
-
-        def add(self, _obj: object) -> None:
-            return None
-
-    session = FakeSession()
-    stage_calls = 0
-
-    async def fake_stage(
-        _session: object,
-        scope: str,
-        scope_id: str,
-        payload: dict[str, object],
-        *,
-        seq: int | None,
-    ) -> tuple[int, dict[str, object]]:
-        nonlocal stage_calls
-        _ = (scope, scope_id)
-        stage_calls += 1
-        session.staged.append((seq, dict(payload)))
-        # Simulate the allocation: the retried append must allocate a fresh,
-        # higher seq rather than reuse the colliding one.
-        return stage_calls, payload
-
-    class FakeFactory:
-        def __call__(self) -> FakeSession:
-            return session
-
-    monkeypatch.setattr(stream_module, "_stage_db_event", fake_stage)
-    monkeypatch.setattr(stream_module, "_metadata_db_ready", lambda: True)
-    monkeypatch.setattr(stream_module.db_manager, "get_session_factory", FakeFactory)
-    seq, payload = await stream_module.append_run_stream_event_atomic(
-        "run-legacy-collision", {"event": "end"}
-    )
-
-    assert seq == 2, "the retried append must allocate a fresh, higher seq"
-    assert payload == {"event": "end"}
-    assert session.commit_calls == 2
-    assert session.rollbacks == 1, "the colliding attempt must be rolled back"
-    assert session.persisted == [(None, {"event": "end"}), (None, {"event": "end"})]
+    assert client.portal.call(exercise) == [(1, {"event": "start"})]

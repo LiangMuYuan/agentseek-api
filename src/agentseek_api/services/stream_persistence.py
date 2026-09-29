@@ -8,8 +8,7 @@ from contextvars import ContextVar
 from typing import Any
 
 from redis.asyncio import Redis, from_url
-from sqlalchemy import delete, func, insert, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import case, delete, func, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agentseek_api.core.database import db_manager
@@ -17,6 +16,7 @@ from agentseek_api.core.orm import RunStreamEvent, StreamSequence, ThreadStreamE
 from agentseek_api.settings import settings
 from agentseek_api.services.thread_protocol import _namespace_matches, protocol_channel_for_method
 from agentseek_api.services.stream_event_buffer import StreamEvent, StreamEventBuffer
+from agentseek_api.services.transaction_retry import retry_transaction
 
 _RUN_STREAM_SEQ_KEY_PREFIX = "agentseek:runs:stream-seq"
 _THREAD_STREAM_SEQ_KEY_PREFIX = "agentseek:threads:stream-seq"
@@ -170,74 +170,41 @@ def _thread_envelope(thread_id: str, seq: int, payload: dict[str, Any]) -> dict[
     }
 
 
-async def _seed_stream_sequence(scope: str, scope_id: str) -> None:
-    """Create the per-stream counter row in its own short transaction.
-
-    Runs outside the caller's transaction so the create-race never executes
-    inside a longer append/terminal transaction: MySQL raises
-    ``SAVEPOINT ... does not exist`` when a concurrent creator collides inside
-    ``begin_nested``. Seeding separately keeps the append transaction purely
-    lock-then-allocate. A concurrent creator is resolved by the unique
-    constraint; the row is seeded from ``MAX(seq)`` so it can be re-created from
-    durable state even if it was deleted out from under an active stream.
-    """
-    session_factory = db_manager.get_session_factory()
+async def _ensure_stream_sequence(session: AsyncSession, scope: str, scope_id: str) -> StreamSequence:
+    """Create/reconcile and lock the counter using the caller's one connection."""
     model = _scope_event_model(scope)
     id_column = model.run_id if scope == "run" else model.thread_id
-    async with session_factory() as session:
-        max_seq = await session.scalar(select(func.max(model.seq)).where(id_column == scope_id))
-        try:
-            session.add(StreamSequence(scope=scope, scope_id=scope_id, seq=max_seq or 0))
-            await session.commit()
-        except IntegrityError:
-            # A concurrent publisher created the row first (or a concurrent
-            # seed committed between our SELECT and INSERT): nothing to do.
-            await session.rollback()
-
-
-async def _ensure_stream_sequence(session: AsyncSession, scope: str, scope_id: str) -> StreamSequence:
-    """Return the per-stream counter row, creating it if missing.
-
-    The row is locked (``SELECT ... FOR UPDATE``) so the caller's transaction
-    holds the only allocation right for this stream; concurrent publishers
-    serialize on this single row and can never observe the same ``MAX(seq)+1``.
-    Two database pitfalls are deliberately avoided:
-
-    - ``FOR UPDATE`` is never issued against a missing row: on MySQL/InnoDB a
-      point ``FOR UPDATE`` over a non-existent unique key takes a gap lock, and
-      the separate-transaction seed then deadlocks against it (``Lock wait
-      timeout``). The row is seeded first (its own short transaction) and only
-      then locked.
-    - After seeding in a separate transaction, the row is confirmed with a
-      ``FOR UPDATE`` current read: under MySQL REPEATABLE READ a plain ``SELECT``
-      would keep returning the pre-seed snapshot within the caller's
-      transaction.
-
-    A missing row (first append, or deleted out from under an active stream by
-    the two-phase delete path in ``threads.py``) is re-seeded from ``MAX(seq)``.
-    The in-process per-stream lock serializes the seed so a first-append burst
-    opens one seed transaction instead of exhausting the metadata pool.
-    """
-    stmt = select(StreamSequence).where(
-        StreamSequence.scope == scope, StreamSequence.scope_id == scope_id
+    maximum = select(func.coalesce(func.max(model.seq), 0)).where(id_column == scope_id).scalar_subquery()
+    dialect = session.get_bind().dialect.name
+    values = {"scope": scope, "scope_id": scope_id, "seq": maximum}
+    if dialect == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as dialect_insert
+        statement = dialect_insert(StreamSequence).values(**values)
+        statement = statement.on_conflict_do_update(
+            index_elements=["scope", "scope_id"],
+            set_={"seq": case((StreamSequence.seq < statement.excluded.seq, statement.excluded.seq), else_=StreamSequence.seq)},
+        )
+    elif dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as dialect_insert
+        statement = dialect_insert(StreamSequence).values(**values)
+        statement = statement.on_conflict_do_update(
+            index_elements=["scope", "scope_id"],
+            set_={"seq": func.greatest(StreamSequence.seq, statement.excluded.seq)},
+        )
+    elif dialect in {"mysql", "mariadb"}:
+        from sqlalchemy.dialects.mysql import insert as dialect_insert
+        statement = dialect_insert(StreamSequence).values(**values)
+        statement = statement.on_duplicate_key_update(seq=func.greatest(StreamSequence.seq, statement.inserted.seq))
+    else:
+        raise ValueError(f"Unsupported stream counter dialect: {dialect}")
+    await session.execute(statement)
+    # populate_existing is essential if the session saw this counter before
+    # another transaction committed; allocation must read the winning row.
+    return await session.scalar(
+        select(StreamSequence).where(
+            StreamSequence.scope == scope, StreamSequence.scope_id == scope_id
+        ).with_for_update().execution_options(populate_existing=True)
     )
-    lock_key = (scope, scope_id)
-    lock = _stream_seed_locks.setdefault(lock_key, asyncio.Lock())
-    async with lock:
-        for _ in range(_MAX_ATOMIC_APPEND_RETRIES):
-            row = await session.scalar(stmt)
-            if row is not None:
-                # Row exists: the unique index turns this into a record lock
-                # only - no gap lock, safe to hold across the allocation.
-                locked = await session.scalar(stmt.with_for_update())
-                if locked is not None:
-                    return locked
-            await _seed_stream_sequence(scope, scope_id)
-            # Current read: sees the seed even under snapshot isolation.
-            locked = await session.scalar(stmt.with_for_update())
-            if locked is not None:
-                return locked
-    raise RuntimeError(f"Failed to establish {scope} stream sequence counter for {scope_id}")
 
 
 async def _stage_db_event(
@@ -295,31 +262,9 @@ async def _db_append(
     *,
     seq: int | None = None,
 ) -> tuple[int, dict[str, Any]]:
-    """Append a stream event to the metadata DB atomically.
-
-    One transaction per attempt: lock the per-stream counter row, allocate the
-    seq, insert the event row. A uniqueness collision (concurrent publisher, or
-    a pre-assigned ``seq`` that collides with an out-of-band row) is healed by
-    rolling back and re-allocating from durable state, keeping the stream
-    monotonic instead of dropping the frame. Any other failure raises - the
-    caller must not expose an event whose durable append did not succeed.
-    """
-    session_factory = db_manager.get_session_factory()
-    async with session_factory() as session:
-        for _ in range(_MAX_ATOMIC_APPEND_RETRIES):
-            try:
-                result = await _stage_db_event(session, scope, scope_id, payload, seq=seq)
-                await session.commit()
-                return result
-            except IntegrityError:
-                await session.rollback()
-                # Re-allocate from durable state next attempt instead of
-                # reusing the colliding seq.
-                seq = None
-        raise RuntimeError(
-            f"Failed to atomically append {scope} stream event after "
-            f"{_MAX_ATOMIC_APPEND_RETRIES} attempts (scope_id={scope_id})"
-        )
+    async def append(session: AsyncSession):
+        return await _stage_db_event(session, scope, scope_id, payload, seq=seq)
+    return await retry_transaction(append)
 
 
 async def append_run_stream_event_atomic(
@@ -628,7 +573,53 @@ async def _buffer_stream_event(record: StreamEvent) -> bool:
         return False
 
 
+async def buffer_durable_event(kind: str, stream_id: str, payload: dict[str, Any], publish) -> bool:
+    """Queue an unallocated event; only the committed batch may publish it."""
+    buffer = _stream_buffer.get()
+    if buffer is None or stream_id != (buffer.run_id if kind == "run" else buffer.thread_id):
+        return False
+    return await buffer.append(StreamEvent(kind, stream_id, 0, payload, publish))
+
+
+async def _commit_allocated_stream_batch(records: list[StreamEvent]) -> None:
+    async def stage(session: AsyncSession):
+        results = []
+        groups: dict[tuple[str, str], list[StreamEvent]] = {}
+        for record in records:
+            groups.setdefault((record.kind, record.stream_id), []).append(record)
+        for (kind, stream_id), group in sorted(groups.items()):
+            counter = await _ensure_stream_sequence(session, kind, stream_id)
+            model = _scope_event_model(kind)
+            id_field = "run_id" if kind == "run" else "thread_id"
+            name_field = "event" if kind == "run" else "method"
+            rows = []
+            for record in group:
+                counter.seq += 1
+                seq = counter.seq
+                payload = dict(record.payload) if kind == "run" else _thread_envelope(stream_id, seq, record.payload)
+                rows.append({id_field: stream_id, "seq": seq, name_field: str(payload.get("method") or payload.get("event", "message")), "payload_json": payload})
+                results.append((record, seq, payload))
+            await session.execute(insert(model), rows)
+        return results
+
+    results = await retry_transaction(stage)
+    for record, seq, payload in results:
+        if record.publish is not None:
+            try:
+                record.publish(seq, payload)
+            except Exception:
+                # The commit already succeeded. Re-appending would duplicate
+                # durable history; a reconnect can replay the committed record.
+                logger.exception("Broker notification failed after stream batch commit")
+
+
 async def _persist_stream_event_batch(records: list[StreamEvent]) -> None:
+    allocated = [record for record in records if record.publish is not None]
+    if allocated:
+        await _commit_allocated_stream_batch(allocated)
+    records = [record for record in records if record.publish is None]
+    if not records:
+        return
     groups: dict[tuple[str, str], dict[int, StreamEvent]] = {}
     for record in records:
         groups.setdefault((record.kind, record.stream_id), {}).setdefault(record.seq, record)

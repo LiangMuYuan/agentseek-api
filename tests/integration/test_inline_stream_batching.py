@@ -303,7 +303,7 @@ async def test_independent_runs_do_not_flush_each_others_buffers(
     assert len(await read_payloads(factory, RunStreamEvent)) == 2
 
 
-async def test_live_event_delivery_does_not_wait_for_sql(stream_db, monkeypatch):
+async def test_live_event_delivery_waits_for_durable_batch(stream_db, monkeypatch):
     from functools import partial
     from agentseek_api.services.stream_event_buffer import StreamEventBuffer
 
@@ -325,19 +325,15 @@ async def test_live_event_delivery_does_not_wait_for_sql(stream_db, monkeypatch)
         event.listen(engine.sync_engine, "before_cursor_execute", unexpected_sql)
         try:
             await run_jobs._publish_run_event("run-1", "message_chunk", content="hello")
-            stream = run_jobs.run_broker.stream_records("run-1")
-            try:
-                assert await anext(stream) == (
-                    1,
-                    {"event": "message_chunk", "content": "hello"},
-                )
-            finally:
-                await stream.aclose()
+            assert run_jobs.run_broker.snapshot_records("run-1") == []
             assert sql_calls == []
         finally:
             event.remove(engine.sync_engine, "before_cursor_execute", unexpected_sql)
     assert await read_payloads(factory, RunStreamEvent) == [
         {"event": "message_chunk", "content": "hello"}
+    ]
+    assert run_jobs.run_broker.snapshot_records("run-1") == [
+        (1, {"event": "message_chunk", "content": "hello"})
     ]
 
 
@@ -419,13 +415,16 @@ async def test_replay_orders_buffered_events_before_later_persisted_events(
     task = asyncio.create_task(first_run())
     try:
         await asyncio.wait_for(published.wait(), 1)
-        # A different task has no buffer, so seq 2 reaches SQL before seq 1.
+        # A different task has no buffer, so it commits the first cursor.
         await thread_protocol.apublish_values_event(
             "thread-1", values={"index": 2}, run_id="run-1"
         )
         assert [
             item["seq"] for item in await read_payloads(factory, ThreadStreamEvent)
-        ] == [2]
+        ] == [1]
+        release.set()
+        await task
+        assert [item["params"]["data"]["index"] for item in await read_payloads(factory, ThreadStreamEvent)] == [2, 1]
         user = User(identity="user-1")
         if route == "protocol":
             response = await streaming.stream_thread_protocol_events(

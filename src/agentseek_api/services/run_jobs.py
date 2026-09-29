@@ -19,6 +19,7 @@ from agentseek_api.services.stream_persistence import (
     append_run_stream_event_atomic,
     append_thread_stream_event_atomic,
     buffered_stream_persistence,
+    buffer_durable_event,
     next_run_stream_seq,  # noqa: F401 - module attribute; tests assert the redis path never calls it
     next_thread_stream_seq,  # noqa: F401 - module attribute; tests assert the redis path never calls it
     persist_thread_stream_events,
@@ -141,6 +142,12 @@ async def _publish_run_event(
     transaction and only then publishes to the in-memory broker, so the broker
     never exposes a seq that is not durable.
     """
+    if settings.EXECUTOR_BACKEND.strip().lower() != "redis":
+        if await buffer_durable_event(
+            "run", run_id, {"event": event, **payload},
+            lambda seq, saved: run_broker.publish(run_id, saved["event"], seq=seq, **{k: v for k, v in saved.items() if k != "event"}),
+        ):
+            return None
     if settings.EXECUTOR_BACKEND.strip().lower() == "redis":
         event_payload = {"event": event, **payload}
         try:

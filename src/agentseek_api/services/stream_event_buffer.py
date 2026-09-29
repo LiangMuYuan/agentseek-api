@@ -17,6 +17,7 @@ class StreamEvent:
     stream_id: str
     seq: int
     payload: dict[str, Any]
+    publish: Callable[[int, dict[str, Any]], Any] | None = None
 
 
 class StreamEventBuffer:

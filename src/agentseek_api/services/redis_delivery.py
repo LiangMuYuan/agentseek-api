@@ -61,7 +61,9 @@ async def _deliver(operation_id):
         if row.run_bound:
             run = await session.scalar(select(Run).where(Run.run_id == row.run_id).with_for_update())
             if run is None or run.execution_id != row.execution_id or run.status in {"success", "error", "interrupted"}:
-                await session.delete(row)
+                # Discard delivery but retain the cleanup intent until Redis
+                # acknowledges expiry; a transient failure must not leak markers.
+                row.records = []
                 return envelopes, []
         if row.records is None:
             async with asyncio.timeout(5):

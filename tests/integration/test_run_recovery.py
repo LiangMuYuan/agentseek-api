@@ -319,7 +319,7 @@ async def test_broker_failure_does_not_undo_terminal_commit(recovery_db, monkeyp
         assert len(list(await session.scalars(select(ThreadStreamEvent)))) == 1
 
 
-async def test_populated_legacy_runs_upgrade_is_idempotent(tmp_path):
+async def test_populated_legacy_runs_upgrade_is_idempotent(tmp_path, monkeypatch):
     from agentseek_api.core.database import DatabaseManager
     from sqlalchemy import text
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/legacy.db")
@@ -341,6 +341,20 @@ async def test_populated_legacy_runs_upgrade_is_idempotent(tmp_path):
         assert row.status == "running" and row.input_json == {}
         assert row.dispatch_state == "pending" and row.execution_id is None
         assert row.terminal_result is None and row.execution_owner is None
+    from agentseek_api.services.run_dispatch import reconcile_legacy_runs
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(db_manager, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(settings, "EXECUTOR_BACKEND", "inline")
+    async with factory() as session:
+        session.add(Thread(thread_id="thread", user_id="user", status="busy"))
+        await session.commit()
+    await reconcile_legacy_runs()
+    async with factory() as session:
+        row = await session.get(Run, "legacy")
+        assert row.status == "error"
+        assert "upgrade" in row.last_error.lower()
+        assert (await session.get(Thread, "thread")).status == "error"
+    assert await reconcile_legacy_runs() == 0
     await engine.dispose()
 async def test_reclaimed_execution_cannot_publish_more_protocol_frames(recovery_db, monkeypatch):
     from agentseek_api.core.orm import RunStreamEvent, ThreadStreamEvent
@@ -359,3 +373,84 @@ async def test_reclaimed_execution_cannot_publish_more_protocol_frames(recovery_
     async with factory() as session:
         assert not list(await session.scalars(select(RunStreamEvent).where(RunStreamEvent.event == "values")))
         assert not list(await session.scalars(select(ThreadStreamEvent).where(ThreadStreamEvent.method == "values")))
+
+
+@pytest.mark.parametrize("failure", ["reclaimed", "database"])
+async def test_lease_loss_cancels_execution_and_stops_heartbeat(recovery_db, monkeypatch, failure):
+    from agentseek_api.services import run_dispatch
+    factory, job = recovery_db
+    await run_dispatch.claim_execution(job, owner_id="owner", recovered=False)
+    monkeypatch.setattr(run_dispatch, "LEASE_SECONDS", 0.015)
+    renewed = asyncio.Event()
+    original = run_dispatch.retry_transaction
+
+    async def observe(operation):
+        if failure == "database":
+            raise RuntimeError("database unavailable")
+        result = await original(operation)
+        renewed.set()
+        return result
+    monkeypatch.setattr(run_dispatch, "retry_transaction", observe)
+
+    async def execute():
+        async with run_dispatch.execution_lease(job):
+            if failure == "reclaimed":
+                await renewed.wait()
+                async with factory() as session:
+                    row = await session.get(Run, "r")
+                    assert row.execution_lease_until is not None
+                    row.execution_owner = "new"
+                    await session.commit()
+            await asyncio.Event().wait()
+    task = asyncio.create_task(execute())
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 2)
+    assert not [item for item in asyncio.all_tasks() if item.get_name() == "run-lease:r"]
+@pytest.mark.parametrize("race", ["delete", "cancel"])
+async def test_redis_start_is_fenced_after_claim(recovery_db, monkeypatch, race):
+    from agentseek_api.services import run_dispatch, stream_persistence
+    factory, job = recovery_db
+    monkeypatch.setattr(settings, "EXECUTOR_BACKEND", "redis")
+    original_claim = run_dispatch.claim_execution
+    published, executed = [], []
+
+    async def raced_claim(*args, **kwargs):
+        result = await original_claim(*args, **kwargs)
+        async with factory() as session:
+            row = await session.get(Run, "r")
+            if race == "delete":
+                await session.delete(row)
+            else:
+                row.status, row.last_error = "error", "Run cancelled"
+            await session.commit()
+        return result
+
+    async def append(*args, **kwargs):
+        published.append((args, kwargs))
+        return 1, {"event": "start"}
+
+    async def execute(**kwargs):
+        executed.append(kwargs)
+        return run_jobs.RunExecutionResult(output={}, interrupted=False, interrupts=[])
+    monkeypatch.setattr(run_dispatch, "claim_execution", raced_claim)
+    monkeypatch.setattr(run_jobs, "append_redis_run_stream_event", append)
+    monkeypatch.setattr(stream_persistence, "append_redis_envelope", append)
+    monkeypatch.setattr(run_jobs, "execute_run", execute)
+    await run_jobs.execute_run_job(job)
+    assert published == []
+    assert executed == []
+async def test_legacy_reconciliation_does_not_terminate_new_generation(recovery_db, monkeypatch):
+    from agentseek_api.services import terminal_delivery
+    from agentseek_api.services.run_dispatch import reconcile_legacy_runs
+    factory, _job = recovery_db
+    original = terminal_delivery.finish_run
+    async def concurrently_claimed(job, result, **kwargs):
+        async with factory() as session:
+            row = await session.get(Run, "r")
+            row.execution_id, row.execution_owner = "new-generation", "new-owner"
+            await session.commit()
+        return await original(job, result, **kwargs)
+    monkeypatch.setattr(terminal_delivery, "finish_run", concurrently_claimed)
+    await reconcile_legacy_runs()
+    async with factory() as session:
+        assert (await session.get(Run, "r")).status == "pending"

@@ -67,18 +67,8 @@ class InlineExecutor:
         if callable(job):
             await job()
             return
-        from agentseek_api.services.run_preparation import _execute_and_persist
-
-        await _execute_and_persist(
-            run_id=job.run_id,
-            thread_id=job.thread_id,
-            user_id=job.user_id,
-            payload=job.payload,
-            graph_id=job.graph_id,
-            kwargs=job.kwargs,
-            resume=job.resume,
-            is_resume=job.is_resume,
-        )
+        from agentseek_api.services.run_jobs import execute_run_job
+        await execute_run_job(job)
 
 
 async def header_user_override(request: Request) -> User:
@@ -272,3 +262,17 @@ def test_live_provider_stream_emits_multiple_message_chunks(live_provider_client
     streamed_body = streamed_waited.json()
     assert streamed_body["status"] == "success", streamed_body.get("last_error")
     assert _normalize_text(accumulated_text) == _normalize_text(streamed_body["output"]["final_text"])
+async def test_live_provider_fixture_forwards_execution_identity(monkeypatch):
+    from agentseek_api.services import run_jobs
+    from agentseek_api.services.run_jobs import RunExecutionJob
+    seen = []
+    async def execute(job):
+        seen.append(job)
+    monkeypatch.setattr(run_jobs, "execute_run_job", execute)
+    job = RunExecutionJob(run_id="r", thread_id="t", user_id="u", graph_id="g", payload={},
+        execution_id="generation", owner_id="owner", owns_accounting=True)
+    await InlineExecutor().submit(job)
+    assert len(seen) == 1
+    assert seen[0].execution_id == "generation"
+    assert seen[0].owns_accounting is True
+    assert seen[0].owner_id == "owner"

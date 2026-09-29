@@ -154,7 +154,25 @@ async def _publish_run_event(
             return None
     if settings.EXECUTOR_BACKEND.strip().lower() == "redis":
         event_payload = {"event": event, **payload}
-        seq, _ = await append_redis_run_stream_event(run_id, event_payload)
+        from agentseek_api.services.run_dispatch import current_execution, fence_execution_writes
+        execution = current_execution.get()
+        if execution is None:
+            seq, _ = await append_redis_run_stream_event(run_id, event_payload)
+        else:
+            from uuid import uuid4
+            from agentseek_api.services.stream_persistence import append_redis_envelope
+            from agentseek_api.services.transaction_retry import retry_transaction
+            import asyncio
+            operation_id = f"execution:{execution[1]}:{uuid4()}"
+            async def append(session):
+                # Hold the execution row's write lock across Redis delivery.
+                # A deletion/cancellation either wins before this fence or
+                # waits for this append and can then remove/terminate it.
+                await fence_execution_writes(session)
+                async with asyncio.timeout(5):
+                    return await append_redis_envelope(scope="run", stream_id=run_id,
+                        operation_id=operation_id, payload=event_payload)
+            seq, _ = await retry_transaction(append)
         return run_broker.publish(run_id, event, seq=seq, **payload)
     seq, _ = await append_run_stream_event_atomic(run_id, {"event": event, **payload})
     return run_broker.publish(run_id, event, seq=seq, **payload)

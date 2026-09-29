@@ -569,6 +569,11 @@ async def delete_run_stream_events(run_ids: list[str]) -> None:
     if _uses_redis_executor():
         keys = [key for run_id in run_ids for key in (_run_stream_key(run_id), f"{_RUN_STREAM_SEQ_KEY_PREFIX}:{run_id}")]
         try:
+            from agentseek_api.services.terminal_delivery import cleanup_terminal_markers_for_runs
+            await cleanup_terminal_markers_for_runs(run_ids)
+        except Exception:
+            logger.warning("Redis terminal marker cleanup remains queued", exc_info=True)
+        try:
             await _get_redis_client().delete(*keys)
         except Exception:
             logger.warning("Failed to delete Redis run stream keys", extra={"run_ids": run_ids}, exc_info=True)

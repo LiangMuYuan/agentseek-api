@@ -15,7 +15,7 @@ from typing import Any
 from sqlalchemy import select, update
 
 from agentseek_api.core.database import db_manager
-from agentseek_api.core.orm import Run, Thread
+from agentseek_api.core.orm import Run, Thread, StreamCleanup
 from agentseek_api.services.stream_persistence import (
     add_run_stream_event_to_session,
     add_thread_stream_event_to_session,
@@ -128,6 +128,9 @@ async def finish_run(job, result: TerminalResult, *, cancel: bool = False) -> bo
             run.status = "terminal_pending"
             run.terminal_result = stored
             run.execution_lease_until = None
+            session.add(StreamCleanup(operation_id=f"terminal:{job.run_id}:{job.execution_id}",
+                run_id=job.run_id, execution_id=job.execution_id,
+                envelopes=[{k: v for k, v in envelope.items() if k != "payload"} for envelope in envelopes]))
             return envelopes, []
         await _apply_result(session, run, stored)
         end = await add_run_stream_event_to_session(session, job.run_id, payload=envelopes[0]["payload"])
@@ -171,25 +174,46 @@ async def _deliver_pending(run_id: str, generation: str) -> bool:
     return True
 
 
-async def _cleanup_terminal_markers(run_id: str, generation: str) -> None:
-    from agentseek_api.services.stream_persistence import expire_redis_envelope
+async def _cleanup_terminal_markers(run_id: str, generation: str | None) -> None:
+    from agentseek_api.services.stream_persistence import expire_redis_envelope, _get_redis_client, _operation_key
     try:
-        async with db_manager.get_session_factory()() as session:
-            run = await session.get(Run, run_id)
-            if run is None or run.execution_id != generation or run.status not in TERMINAL or not run.terminal_result:
-                return
-            envelopes = run.terminal_result["envelopes"]
-        async with asyncio.timeout(5):
-            for envelope in envelopes:
-                await expire_redis_envelope(**envelope)
         async def cleanup(session):
-            await session.execute(update(Run).where(
-                Run.run_id == run_id, Run.execution_id == generation, Run.status.in_(TERMINAL),
-            ).values(terminal_result=None))
+            # Same lock order as terminal delivery. The cleanup row is not a
+            # child FK: deletion/resume must not destroy cleanup ownership.
+            run = await session.scalar(select(Run).where(Run.run_id == run_id).with_for_update())
+            intent = await session.scalar(select(StreamCleanup).where(
+                StreamCleanup.operation_id == f"terminal:{run_id}:{generation}").with_for_update())
+            if intent is None:
+                return
+            await session.execute(update(StreamCleanup).where(
+                StreamCleanup.operation_id == intent.operation_id).values(operation_id=intent.operation_id))
+            same_generation = run is not None and run.execution_id == generation
+            if same_generation and run.status not in TERMINAL:
+                return  # Pending delivery still needs non-expiring markers.
+            async with asyncio.timeout(5):
+                for envelope in intent.envelopes:
+                    if run is None:
+                        await _get_redis_client().delete(_operation_key(**envelope))
+                    else:
+                        await expire_redis_envelope(**envelope)
+            await session.delete(intent)
+            if same_generation:
+                run.terminal_result = None
         await retry_transaction(cleanup)
     except Exception:
         logger.exception("Terminal marker cleanup remains pending", extra={"run_id": run_id})
 
+
+async def cleanup_terminal_markers_for_runs(run_ids: list[str] | None = None, *, limit: int = 100) -> None:
+    async with db_manager.get_session_factory()() as session:
+        query = select(StreamCleanup.run_id, StreamCleanup.execution_id).order_by(StreamCleanup.created_at)
+        if run_ids is not None:
+            query = query.where(StreamCleanup.run_id.in_(run_ids))
+        else:
+            query = query.limit(limit)
+        pending = list((await session.execute(query)).all())
+    for run_id, generation in pending:
+        await _cleanup_terminal_markers(run_id, generation)
 
 async def reconcile_terminal_deliveries(*, limit: int = 100) -> int:
     async with db_manager.get_session_factory()() as session:
@@ -205,4 +229,5 @@ async def reconcile_terminal_deliveries(*, limit: int = 100) -> int:
                 await _cleanup_terminal_markers(run_id, generation)
         except Exception:
             logger.exception("Terminal delivery remains pending", extra={"run_id": run_id})
+    await cleanup_terminal_markers_for_runs(limit=limit)
     return completed

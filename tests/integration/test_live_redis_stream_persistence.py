@@ -161,7 +161,7 @@ async def test_protocol_pair_reconciles_after_second_log_failure(run_storage, mo
 
 
 async def test_pending_protocol_delivery_does_not_resurrect_deleted_run(run_storage, monkeypatch):
-    from agentseek_api.core.orm import Run
+    from agentseek_api.core.orm import Run, StreamDelivery
     from agentseek_api.services import redis_delivery
     redis = from_url(_TEST_REDIS_URL, decode_responses=True)
     identity = uuid4().hex
@@ -184,9 +184,72 @@ async def test_pending_protocol_delivery_does_not_resurrect_deleted_run(run_stor
             await session.commit()
         await redis.delete(stream_module._run_stream_key(identity))
         monkeypatch.setattr(stream_module, "append_redis_envelope", original)
+        expire = stream_module.expire_redis_envelope
+        async def fail_cleanup(**kwargs):
+            raise RuntimeError("cleanup unavailable")
+        monkeypatch.setattr(stream_module, "expire_redis_envelope", fail_cleanup)
+        await redis_delivery.reconcile_protocol_deliveries()
+        async with run_storage() as session:
+            pending = await session.get(StreamDelivery, identity)
+            assert pending is not None, "failed marker cleanup must retain its recovery record"
+            assert pending.records == []
+        monkeypatch.setattr(stream_module, "expire_redis_envelope", expire)
         await redis_delivery.reconcile_protocol_deliveries()
         assert await redis.xlen(stream_module._run_stream_key(identity)) == 0
         assert await redis.xlen(stream_module._thread_stream_key(identity)) == 0
+        assert await redis.ttl(stream_module._operation_key("run", identity, f"{identity}:run")) > 0
+        async with run_storage() as session:
+            assert await session.get(StreamDelivery, identity) is None
+    finally:
+        keys = await redis.keys(f"*{identity}*")
+        if keys:
+            await redis.delete(*keys)
+        await redis.aclose()
+@pytest.mark.parametrize("race", ["delete", "resume"])
+async def test_terminal_marker_cleanup_survives_run_replacement(run_storage, monkeypatch, race):
+    from agentseek_api.core.orm import Run
+    from agentseek_api.services import terminal_delivery
+    from agentseek_api.services.run_jobs import RunExecutionJob
+    redis = from_url(_TEST_REDIS_URL, decode_responses=True)
+    identity = uuid4().hex
+    monkeypatch.setattr(stream_module, "_redis_client", redis)
+    monkeypatch.setattr(stream_module.settings, "EXECUTOR_BACKEND", "redis")
+    job = RunExecutionJob(run_id=identity, thread_id=identity, user_id="u1", graph_id="g", payload={},
+        execution_id="generation", owner_id="owner")
+    async with run_storage() as session:
+        session.add(Run(run_id=identity, thread_id=identity, assistant_id="a1", user_id="u1",
+            status="running", execution_id="generation", execution_owner="owner"))
+        await session.commit()
+    original_append = terminal_delivery.append_redis_envelope
+    original_cleanup = terminal_delivery._cleanup_terminal_markers
+    async def append(**kwargs):
+        if race == "delete" and kwargs["scope"] == "thread":
+            raise RuntimeError("second terminal log failed")
+        return await original_append(**kwargs)
+    async def pause_cleanup(*args, **kwargs):
+        pass
+    monkeypatch.setattr(terminal_delivery, "append_redis_envelope", append)
+    monkeypatch.setattr(terminal_delivery, "_cleanup_terminal_markers", pause_cleanup)
+    try:
+        if race == "delete":
+            with pytest.raises(RuntimeError, match="second terminal"):
+                await terminal_delivery.finish_run(job, terminal_delivery.TerminalResult(status="success"))
+        else:
+            await terminal_delivery.finish_run(job, terminal_delivery.TerminalResult(status="interrupted"))
+        markers = await redis.keys(f"*{identity}*:op:*")
+        assert markers and all([await redis.ttl(key) == -1 for key in markers])
+        async with run_storage() as session:
+            row = await session.get(Run, identity)
+            if race == "delete":
+                await session.delete(row)
+            else:
+                row.execution_id, row.terminal_result, row.status = "new-generation", None, "pending"
+            await session.commit()
+        monkeypatch.setattr(terminal_delivery, "_cleanup_terminal_markers", original_cleanup)
+        await terminal_delivery.reconcile_terminal_deliveries()
+        assert all([await redis.ttl(key) != -1 for key in markers])
+        if race == "delete":
+            assert not await redis.keys(f"*{identity}*:op:*")
     finally:
         keys = await redis.keys(f"*{identity}*")
         if keys:

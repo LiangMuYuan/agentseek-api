@@ -189,9 +189,19 @@ async def run_recovery_service(*, queue=None):
     from agentseek_api.services.terminal_delivery import reconcile_terminal_deliveries
     from agentseek_api.services.redis_delivery import reconcile_protocol_deliveries
 
+    # Pre-upgrade inline tasks cannot survive process restart. They did not
+    # persist a resume command/generation, so do not guess and rerun side effects.
+    legacy_pending = settings.EXECUTOR_BACKEND.strip().lower() == "inline"
+    started_at = datetime.now(UTC)
+
     async def reconcile():
+        nonlocal legacy_pending
         while True:
             try:
+                if legacy_pending:
+                    while await reconcile_legacy_runs(created_before=started_at):
+                        pass
+                    legacy_pending = False
                 if settings.EXECUTOR_BACKEND.strip().lower() == "redis":
                     await reconcile_protocol_deliveries()
                 await reconcile_terminal_deliveries()
@@ -206,3 +216,24 @@ async def run_recovery_service(*, queue=None):
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+async def reconcile_legacy_runs(*, limit: int = 100, created_before: datetime | None = None) -> int:
+    from agentseek_api.core.database import db_manager
+    from agentseek_api.services.run_jobs import RunExecutionJob
+    from agentseek_api.services.terminal_delivery import TerminalResult, finish_run
+    if settings.EXECUTOR_BACKEND.strip().lower() != "inline":
+        return 0  # Redis preserves/requeues legacy payloads under its worker lease.
+    async with db_manager.get_session_factory()() as session:
+        query = select(Run).where(
+            Run.execution_id.is_(None), Run.status.in_(["pending", "running"]),
+        )
+        if created_before is not None:
+            query = query.where(Run.created_at < created_before)
+        rows = list(await session.scalars(query.limit(limit)))
+    for run in rows:
+        await finish_run(RunExecutionJob(run_id=run.run_id, thread_id=run.thread_id,
+            user_id=run.user_id, graph_id="default", payload=run.input_json),
+            TerminalResult(status="error", output=run.output_json,
+                error="RunInterruptedByUpgrade: Legacy inline execution cannot be recovered safely after upgrade; resubmit the run"))
+    return len(rows)

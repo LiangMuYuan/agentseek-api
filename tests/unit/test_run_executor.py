@@ -1089,3 +1089,43 @@ async def test_execute_run_idless_messages_from_different_namespaces_get_distinc
     ]
     assert len(message_ids) == len(set(message_ids)), f"id-less message ids collided: {message_ids}"
     assert [event["params"]["namespace"] for event in metadata_events] == [["ns_a:task-1"], ["ns_b:task-1"]]
+
+
+@pytest.mark.parametrize("events", [False, True])
+async def test_real_langgraph_callback_stream_keeps_separate_model_invocations(monkeypatch, events):
+    import asyncio
+    from typing_extensions import TypedDict
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import StateGraph, START, END
+    from agentseek_api.services import thread_protocol
+
+    class State(TypedDict):
+        input: dict
+        output: dict
+
+    async def model_node(state):
+        first, second = await asyncio.gather(
+            FakeListChatModel(responses=["abc"]).ainvoke("first"),
+            FakeListChatModel(responses=["xy"]).ainvoke("second"),
+        )
+        third = await FakeListChatModel(responses=["qr"]).ainvoke("third")
+        return {"output": {"messages": [first, second, third]}}
+
+    graph = StateGraph(State).add_node("model", model_node).add_edge(START, "model").add_edge("model", END).compile()
+    class Entry(FakeEntry):
+        @staticmethod
+        def build_graph(_checkpointer=None, store=None):
+            return graph
+    db = FakeDBManager()
+    db.langgraph_checkpointer = InMemorySaver()
+    monkeypatch.setattr("agentseek_api.services.run_executor.db_manager", db)
+    monkeypatch.setattr("agentseek_api.services.run_executor.get_langgraph_service", lambda: SimpleNamespace(get_entry=lambda _: Entry()))
+    await execute_run(thread_id="t1", run_id="r1", payload={}, user_id="u1",
+        kwargs={"stream_modes": ["messages-tuple"] + (["events"] if events else [])})
+    records = thread_protocol.thread_protocol_broker.snapshot_records("t1")
+    partials = [r["params"]["data"][0] for r in records if r["method"] == "messages/partial"]
+    accumulated = {m["id"]: m["content"] for m in partials}
+    assert sorted(accumulated.values()) == ["abc", "qr", "xy"]
+    complete = [m for r in records if r["method"] == "messages/complete" for m in r["params"]["data"]]
+    assert {m["id"]: m["content"] for m in complete} == accumulated

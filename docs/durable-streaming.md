@@ -44,6 +44,13 @@ a stored terminal result is delivered without rerunning the graph. Retrying
 graph execution after a crash can repeat graph-side effects: tools requiring
 exactly-once behavior need their own idempotency keys.
 
+Before upgrading an existing deployment, stop/drain the old inline workers.
+Pre-upgrade pending/running inline rows have no durable generation or resume
+command. Startup marks them `error` with `RunInterruptedByUpgrade` and releases
+their busy threads; explicitly resubmit them if needed. It does not guess a
+resume command or silently repeat unknown side effects. Redis legacy queued
+payloads retain their worker-lease recovery path.
+
 Redis terminal delivery has three phases: persist the intended result in SQL,
 append both durable stream envelopes, then apply the final SQL state. An SSE
 terminal event can therefore appear while GET run temporarily reports
@@ -52,6 +59,11 @@ the stored result. This is not a cross-store atomic transaction. Redis itself
 must be configured for the persistence/replication guarantees your deployment
 requires; an accepted write to a non-persistent Redis instance is not a
 power-loss guarantee.
+
+Generation-specific terminal cleanup records are stored separately from runs.
+Deletion and interrupt/resume cannot discard the only ownership record for
+non-expiring Redis delivery markers. Reconciliation removes deleted-run markers
+or gives completed-generation markers their normal bounded retention.
 
 Provider-backed proof stays in `.github/workflows/live-provider-streaming.yml`,
 not default PR CI. It must demonstrate multiple incremental frames and final

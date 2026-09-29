@@ -65,6 +65,16 @@ class Run(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now, onupdate=_utc_now, nullable=False)
 
 
+class StreamCleanup(Base):
+    """Generation-specific Redis cleanup ownership survives Run deletion/resume."""
+    __tablename__ = "stream_cleanups"
+    operation_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    execution_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    envelopes: Mapped[list] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now, nullable=False)
+
+
 class StreamDelivery(Base):
     """A pending Redis run/thread pair; removed after both durable acknowledgments."""
     __tablename__ = "stream_deliveries"

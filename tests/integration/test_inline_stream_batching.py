@@ -145,6 +145,12 @@ async def test_replay_preserves_saved_payload_after_producer_mutates_live_value(
         values["messages"][0]["text"] = "mutated"
     saved = await read_payloads(factory, ThreadStreamEvent)
     assert saved[0]["params"]["data"]["messages"][0]["text"] == "original"
+    # A replay-only fixture has no execution to finish its pending row. Durable
+    # liveness, unlike the process-local broker count, must see a terminal run.
+    async with factory() as session:
+        row = await session.get(Run, "run-1")
+        row.status = "success"
+        await session.commit()
     response = await streaming.stream_thread_protocol_events(
         "thread-1",
         ProtocolEventStreamRequest(channels=["values"]),
@@ -392,7 +398,7 @@ async def test_replay_orders_buffered_events_before_later_persisted_events(
     from agentseek_api.services.stream_event_buffer import StreamEventBuffer
 
     _, factory, broker = stream_db
-    for module in (runs, streaming, threads):
+    for module in (streaming, threads):
         monkeypatch.setattr(module, "thread_protocol_broker", broker)
     monkeypatch.setattr(
         stream_persistence,

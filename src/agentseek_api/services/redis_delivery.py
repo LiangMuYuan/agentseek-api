@@ -17,6 +17,8 @@ async def append_protocol_pair(*, operation_id, run_id, thread_id, payload):
     # Compare the immutable JSON wire shape, not Python-only tuple/key types.
     payload = json.loads(json.dumps(payload, ensure_ascii=False))
     async def register(session):
+        from agentseek_api.services.run_dispatch import fence_execution_writes
+        await fence_execution_writes(session)
         # Same envelope may be retried concurrently by its producer/reconciler.
         dialect = session.bind.dialect.name
         run = await session.get(Run, run_id)

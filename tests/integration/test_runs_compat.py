@@ -100,7 +100,7 @@ def test_thread_run_wait_and_stream_creation_routes(client: TestClient) -> None:
     joined = client.get(streamed.headers["location"])
     assert joined.status_code == 200
     joined_events = _parse_sse_events(joined.text)
-    assert [event["event"] for event in joined_events] == ["metadata"]
+    assert [event["event"] for event in joined_events] == ["metadata", "end"]
     assert "event: start" not in joined.text
     assert "event: message_chunk" not in joined.text
 
@@ -206,7 +206,7 @@ def test_stateless_wait_stream_and_batch_routes(client: TestClient) -> None:
     joined = client.get(streamed.headers["location"])
     assert joined.status_code == 200
     joined_events = _parse_sse_events(joined.text)
-    assert [event["event"] for event in joined_events] == ["metadata"]
+    assert [event["event"] for event in joined_events] == ["metadata", "end"]
     fetched = client.get(streamed.headers["content-location"])
     assert fetched.status_code == 200
     assert fetched.json()["run_id"] == run_id
@@ -353,7 +353,7 @@ def test_join_stream_accepts_official_json_array_stream_mode_query_without_repla
 
     assert streamed.status_code == 200
     events = _parse_sse_events(streamed.text)
-    assert [event["event"] for event in events] == ["metadata"]
+    assert [event["event"] for event in events] == ["metadata", "end"]
 
 
 def test_join_stream_rejects_blank_stream_mode_query(client: TestClient) -> None:
@@ -615,21 +615,15 @@ def test_create_run_stream_filters_protocol_events_to_created_run(client: TestCl
     async def fake_create_run(*args, **kwargs):
         return created
 
-    async def fake_stream(*args, **kwargs):
-        yield {
-            "seq": 1,
-            "method": "updates",
-            "params": {"run_id": "foreign-run", "data": {"output": {"echo": {"message": "foreign"}}}},
-        }
-        yield {
-            "seq": 2,
-            "method": "updates",
-            "params": {"run_id": "created-run", "data": {"output": {"echo": {"message": "created"}}}},
-        }
-
+    async def seed_logs():
+        from agentseek_api.services.stream_persistence import append_run_stream_event_atomic
+        for identity, message in (("foreign-run", "foreign"), ("created-run", "created")):
+            await append_run_stream_event_atomic(identity, {
+                "method": "updates",
+                "params": {"run_id": identity, "data": {"output": {"echo": {"message": message}}}},
+            })
+    client.portal.call(seed_logs)
     monkeypatch.setattr("agentseek_api.api.runs.create_run", fake_create_run)
-    monkeypatch.setattr("agentseek_api.api.runs.thread_protocol_broker.latest_seq", lambda _thread_id: 0)
-    monkeypatch.setattr("agentseek_api.api.runs.thread_protocol_broker.stream", fake_stream)
 
     response = client.post(
         f"/threads/{thread_id}/runs/stream",

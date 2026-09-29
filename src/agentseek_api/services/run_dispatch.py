@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -16,6 +17,22 @@ from agentseek_api.settings import settings
 LEASE_SECONDS = 30
 TERMINAL = {"success", "error", "interrupted"}
 logger = logging.getLogger(__name__)
+current_execution: ContextVar[tuple[str, str, str] | None] = ContextVar("current_execution", default=None)
+
+
+async def fence_execution_writes(session) -> None:
+    """Fence graph publications in the same transaction that saves their data."""
+    execution = current_execution.get()
+    if execution is None or session.info.get("stream_execution_fence") == execution:
+        return
+    run_id, generation, owner = execution
+    locked = await session.execute(update(Run).where(
+        Run.run_id == run_id, Run.execution_id == generation,
+        Run.execution_owner == owner, Run.status == "running",
+    ).values(execution_owner=owner))
+    if locked.rowcount != 1:
+        raise RuntimeError("Execution no longer owns stream publication")
+    session.info["stream_execution_fence"] = execution
 
 
 def register_dispatch(run, job, *, new_generation: bool = False) -> None:
@@ -90,6 +107,7 @@ async def claim_execution(job, *, owner_id: str, recovered: bool) -> str:
 @asynccontextmanager
 async def execution_lease(job):
     parent = asyncio.current_task()
+    token = current_execution.set((job.run_id, job.execution_id, job.owner_id))
 
     async def heartbeat():
         while True:
@@ -113,6 +131,7 @@ async def execution_lease(job):
     try:
         yield
     finally:
+        current_execution.reset(token)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 

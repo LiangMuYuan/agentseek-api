@@ -249,63 +249,14 @@ async def stream_thread_protocol_events(
     await _get_thread_row(thread_id=thread_id, user=user)
 
     async def _event_iter() -> AsyncIterator[str]:
-        current_seq = after_seq
-        events = await load_thread_stream_events(
-            thread_id,
-            channels=payload.channels,
-            namespaces=payload.namespaces,
-            depth=payload.depth,
-            after_seq=after_seq,
-        )
-        if not _uses_redis_executor():
-            events = thread_protocol_broker.replay_records(
-                thread_id,
-                persisted=events,
-                channels=payload.channels,
-                namespaces=payload.namespaces,
-                depth=payload.depth,
-                after_seq=after_seq,
-            )
-        for event in events:
-            seq = int(event.get("seq", 0))
-            current_seq = max(current_seq, seq)
-            method = str(event.get("method", "event"))
-            body = safe_json_dumps(event)
-            yield f"id: {seq}\nevent: {method}\ndata: {body}\n\n"
-
-        if _uses_redis_executor():
-            async for event in iter_with_sse_keepalives(
-                _iter_persisted_thread_events(
-                    thread_id=thread_id,
-                    payload=payload,
-                    user_id=user.identity,
-                    after_seq=current_seq,
-                )
-            ):
-                if event is None:
-                    yield sse_keepalive_comment()
-                    continue
-                seq = int(event.get("seq", 0))
-                method = str(event.get("method", "event"))
-                body = safe_json_dumps(event)
-                yield f"id: {seq}\nevent: {method}\ndata: {body}\n\n"
-            return
-
-        async for event in iter_with_sse_keepalives(
-            thread_protocol_broker.stream(
-                thread_id,
-                channels=payload.channels,
-                namespaces=payload.namespaces,
-                depth=payload.depth,
-                since=current_seq,
-            )
-        ):
+        async for event in iter_with_sse_keepalives(_iter_persisted_thread_events(
+            thread_id=thread_id, payload=payload, after_seq=after_seq, user_id=user.identity,
+        )):
             if event is None:
                 yield sse_keepalive_comment()
                 continue
             seq = int(event.get("seq", 0))
             method = str(event.get("method", "event"))
-            body = safe_json_dumps(event)
-            yield f"id: {seq}\nevent: {method}\ndata: {body}\n\n"
+            yield f"id: {seq}\nevent: {method}\ndata: {safe_json_dumps(event)}\n\n"
 
     return StreamingResponse(_event_iter(), media_type="text/event-stream")

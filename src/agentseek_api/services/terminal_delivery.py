@@ -48,10 +48,15 @@ def _envelopes(job, result: TerminalResult):
     data = {"event": lifecycle, "graph_name": job.graph_id}
     if result.error is not None:
         data["error"] = result.error
+    end = {"event": "end", "status": result.status}
+    if result.error is not None:
+        end["error"] = result.error
+    if result.status == "interrupted" and isinstance(result.output, dict):
+        end["interrupts"] = result.output.get("interrupts", [])
     return [
         {"scope": "run", "stream_id": job.run_id,
          "operation_id": f"terminal:{job.run_id}:{job.execution_id}:run",
-         "payload": {"event": "end", "status": result.status}},
+         "payload": end},
         {"scope": "thread", "stream_id": job.thread_id,
          "operation_id": f"terminal:{job.run_id}:{job.execution_id}:thread",
          "payload": {"method": "lifecycle", "params": {
@@ -87,15 +92,21 @@ def _publish(envelopes, records):
             logger.exception("Terminal broker notification failed after durable commit")
 
 
-async def finish_run(job, result: TerminalResult) -> None:
+async def finish_run(job, result: TerminalResult, *, cancel: bool = False) -> bool:
     if result.status not in TERMINAL:
         raise ValueError(f"Invalid terminal status: {result.status}")
     redis = settings.EXECUTOR_BACKEND.strip().lower() == "redis"
-    envelopes = _envelopes(job, result)
-
     async def stage(session):
         run = await session.scalar(select(Run).where(Run.run_id == job.run_id).with_for_update())
-        if run is None or run.execution_id != job.execution_id or run.status in TERMINAL:
+        if run is None or run.thread_id != job.thread_id or run.status in TERMINAL:
+            return None
+        if cancel:
+            # Persisting a terminal intent is the completion linearization
+            # point. Cancellation cannot rewrite an already delivered outcome.
+            if run.status == "terminal_pending":
+                return None
+            job.execution_id, job.owner_id = run.execution_id, run.execution_owner
+        elif run.execution_id != job.execution_id:
             return None
         if run.status == "terminal_pending":
             return (run.terminal_result["envelopes"], []) if redis else None
@@ -109,7 +120,10 @@ async def finish_run(job, result: TerminalResult) -> None:
         ).values(status="terminal_pending" if redis else run.status))
         if locked.rowcount != 1:
             return None
+        envelopes = _envelopes(job, result)
         stored = {**asdict(result), "envelopes": envelopes}
+        if cancel:
+            stored["output"] = run.output_json
         if redis:
             run.status = "terminal_pending"
             run.terminal_result = stored
@@ -122,11 +136,12 @@ async def finish_run(job, result: TerminalResult) -> None:
 
     staged = await retry_transaction(stage)
     if staged is None:
-        return
+        return False
     if redis:
         await _deliver_pending(job.run_id, job.execution_id)
     else:
         _publish(*staged)
+    return True
 
 
 async def _deliver_pending(run_id: str, generation: str) -> bool:

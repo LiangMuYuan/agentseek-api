@@ -342,3 +342,20 @@ async def test_populated_legacy_runs_upgrade_is_idempotent(tmp_path):
         assert row.dispatch_state == "pending" and row.execution_id is None
         assert row.terminal_result is None and row.execution_owner is None
     await engine.dispose()
+async def test_reclaimed_execution_cannot_publish_more_protocol_frames(recovery_db, monkeypatch):
+    from agentseek_api.core.orm import RunStreamEvent, ThreadStreamEvent
+    from sqlalchemy import select
+    factory, job = recovery_db
+
+    async def execute(**_kwargs):
+        async with factory() as session:
+            row = await session.get(Run, "r")
+            row.execution_owner = "replacement-owner"
+            await session.commit()
+        await thread_protocol.apublish_values_event("t", values={"stale": True}, run_id="r")
+        return run_jobs.RunExecutionResult(output={}, interrupted=False, interrupts=[])
+    monkeypatch.setattr(run_jobs, "execute_run", execute)
+    await run_jobs.execute_run_job(job)
+    async with factory() as session:
+        assert not list(await session.scalars(select(RunStreamEvent).where(RunStreamEvent.event == "values")))
+        assert not list(await session.scalars(select(ThreadStreamEvent).where(ThreadStreamEvent.method == "values")))

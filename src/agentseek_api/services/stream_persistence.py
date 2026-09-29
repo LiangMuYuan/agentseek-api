@@ -304,6 +304,8 @@ async def _stage_db_event(
     in-session path (terminal events) commits together with the run/thread
     status so ``seq`` and state are durable as one unit.
     """
+    from agentseek_api.services.run_dispatch import fence_execution_writes
+    await fence_execution_writes(session)
     counter = await _ensure_stream_sequence(session, scope, scope_id)
     new_seq = counter.seq + 1 if seq is None else seq
     counter.seq = max(counter.seq, new_seq)
@@ -666,6 +668,8 @@ async def buffer_durable_event(kind: str, stream_id: str, payload: dict[str, Any
 
 async def _commit_allocated_stream_batch(records: list[StreamEvent]) -> None:
     async def stage(session: AsyncSession):
+        from agentseek_api.services.run_dispatch import fence_execution_writes
+        await fence_execution_writes(session)
         results = []
         groups: dict[tuple[str, str], list[StreamEvent]] = {}
         for record in records:

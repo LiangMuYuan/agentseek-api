@@ -296,15 +296,14 @@ async def _apublish_thread_event(thread_id: str, payload: dict[str, Any]) -> dic
 
     buffer = persistence._stream_buffer.get()
     if buffer is not None and buffer.thread_id == thread_id and (not run_id or buffer.run_id == run_id):
-        if await persistence.buffer_durable_event(
-            "thread", thread_id, payload,
+        from agentseek_api.services.stream_event_buffer import StreamEvent
+        records = [StreamEvent("thread", thread_id, 0, payload,
             lambda seq, saved: thread_protocol_broker.publish(thread_id, saved, persist=False, seq=seq),
-        ):
-            if run_id:
-                await persistence.buffer_durable_event(
-                    "run", run_id, payload,
-                    lambda seq, saved: run_broker.publish_protocol(run_id, saved, seq=seq),
-                )
+        )]
+        if run_id:
+            records.append(StreamEvent("run", run_id, 0, payload,
+                lambda seq, saved: run_broker.publish_protocol(run_id, saved, seq=seq)))
+        if await buffer.append_many(records):
             return dict(payload)
     if not run_id:
         seq, saved = await persistence.append_thread_stream_event_atomic(thread_id, payload)

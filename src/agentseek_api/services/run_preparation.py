@@ -1,3 +1,5 @@
+import asyncio
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
@@ -10,6 +12,10 @@ from agentseek_api.services.default_assistants import resolve_assistant_id
 from agentseek_api.services.executor import get_executor
 from agentseek_api.services import run_jobs as run_jobs_module
 from agentseek_api.services.run_jobs import RunExecutionJob
+from agentseek_api.services.run_dispatch import ensure_dispatch, register_dispatch, set_dispatch_state
+from agentseek_api.settings import settings
+
+logger = logging.getLogger(__name__)
 
 execute_run = run_jobs_module.execute_run
 run_broker = run_jobs_module.run_broker
@@ -39,26 +45,19 @@ async def _publish_lifecycle(
 
 
 async def _persist_submission_failure(
-    *,
-    thread_id: str,
-    run_id: str,
-    error: str,
-    run_status: str,
-    thread_status: str,
+    *, thread_id: str, run_id: str, error: str, run_status: str, thread_status: str,
+    job: RunExecutionJob,
 ) -> None:
-    session_factory = db_manager.get_session_factory()
-    async with session_factory() as session:
-        db_run = await session.scalar(select(Run).where(Run.run_id == run_id))
-        if db_run is not None:
-            db_run.status = run_status
-            db_run.last_error = error
-
-        thread = await session.scalar(select(Thread).where(Thread.thread_id == thread_id))
-        if thread is not None:
-            thread.status = thread_status
-            thread.state_updated_at = datetime.now(UTC)
-
-        await session.commit()
+    from agentseek_api.services.terminal_delivery import TerminalResult, finish_run
+    async with db_manager.get_session_factory()() as session:
+        row = await session.get(Run, run_id)
+        if row is None or row.status != "pending" or row.execution_owner is not None:
+            return
+        previous_output = row.output_json
+    await finish_run(job, TerminalResult(
+        status=run_status, error=error, thread_status=thread_status,
+        output=previous_output,
+    ))
 
 
 def _active_run_exists_query(*, thread_id: str, exclude_run_id: str | None = None):
@@ -117,6 +116,8 @@ async def _execute_and_persist(
     kwargs: dict[str, Any] | None = None,
     resume: Any | None = None,
     is_resume: bool = False,
+    execution_id: str | None = None,
+    owns_accounting: bool = False,
 ) -> None:
     run_jobs_module.execute_run = execute_run
     run_jobs_module.run_broker = run_broker
@@ -134,6 +135,8 @@ async def _execute_and_persist(
             kwargs=kwargs or {},
             resume=resume,
             is_resume=is_resume,
+            execution_id=execution_id,
+            owns_accounting=owns_accounting,
         )
     )
 
@@ -239,6 +242,10 @@ async def _prepare_run(
         )
         session.add(run)
         await session.flush()
+        register_dispatch(run, RunExecutionJob(
+            run_id=run.run_id, thread_id=thread_id, user_id=user.identity,
+            payload=payload, graph_id=graph_id, kwargs=kwargs or {},
+        ))
         if tick_id is not None:
             tick = await session.scalar(select(CronTick).where(CronTick.id == tick_id))
             if tick is None:
@@ -265,37 +272,48 @@ async def _submit_prepared_run(
     failure_run_status: str,
     failure_thread_status: str,
 ) -> Run:
-    thread_protocol_broker.run_started(thread_id)
-    await _publish_lifecycle(thread_id, event="started", graph_name=graph_id)
+    job = RunExecutionJob(
+        run_id=run_id, thread_id=thread_id, user_id=user_id, payload=payload,
+        graph_id=graph_id, kwargs=kwargs or {}, resume=resume, is_resume=is_resume,
+    )
+    await ensure_dispatch(job)
+    is_redis = settings.EXECUTOR_BACKEND.strip().lower() == "redis"
+    handed_off = False
+    attempted_submit = False
+    if not is_redis:
+        thread_protocol_broker.run_started(thread_id)
+        job.owns_accounting = True
     try:
-        await get_executor().submit(
-            RunExecutionJob(
-                run_id=run_id,
-                thread_id=thread_id,
-                user_id=user_id,
-                payload=payload,
-                graph_id=graph_id,
-                kwargs=kwargs or {},
-                resume=resume,
-                is_resume=is_resume,
-            )
+        await _publish_lifecycle(thread_id, event="started", graph_name=graph_id)
+        attempted_submit = True
+        await get_executor().submit(job)
+        handed_off = True
+    except BaseException as exc:
+        from redis.exceptions import ConnectionError as RedisConnectionError, TimeoutError as RedisTimeoutError
+
+        ambiguous = is_redis and attempted_submit and isinstance(
+            exc, (RedisConnectionError, RedisTimeoutError, TimeoutError, OSError, asyncio.CancelledError)
         )
-    except Exception as exc:
-        await _persist_submission_failure(
-            thread_id=thread_id,
-            run_id=run_id,
-            error=str(exc),
-            run_status=failure_run_status,
-            thread_status=failure_thread_status,
-        )
-        await _publish_lifecycle(
-            thread_id,
-            event="failed",
-            graph_name=graph_id,
-            error=str(exc),
-        )
-        thread_protocol_broker.run_finished(thread_id)
+        try:
+            if ambiguous:
+                await set_dispatch_state(job, "submitted_unknown")
+            else:
+                await _persist_submission_failure(
+                    thread_id=thread_id, run_id=run_id, error=str(exc),
+                    run_status=failure_run_status, thread_status=failure_thread_status,
+                    job=job,
+                )
+        except Exception:
+            logger.exception("Submission compensation failed; durable dispatch intent retained", extra={"run_id": run_id})
         raise
+    finally:
+        if job.owns_accounting and not handed_off:
+            thread_protocol_broker.run_finished(thread_id)
+            job.owns_accounting = False
+    try:
+        await set_dispatch_state(job, "accepted")
+    except Exception:
+        logger.exception("Dispatch acknowledgment failed", extra={"run_id": run_id})
     loaded = await _load_run(run_id)
     if loaded is None:
         raise ValueError("Run not found")
@@ -409,6 +427,11 @@ async def resume_run(*, thread_id: str, run_id: str, resume: Any, user: User) ->
         graph_id = assistant.graph_id
         payload = run.input_json
         run.status = "pending"
+        register_dispatch(run, RunExecutionJob(
+            run_id=run_id, thread_id=thread_id, user_id=run.user_id,
+            payload=payload, graph_id=graph_id, kwargs=run.kwargs_json or {},
+            resume=resume, is_resume=True,
+        ), new_generation=True)
         run.last_error = None
         thread.status = "busy"
         thread.state_updated_at = claimed_at

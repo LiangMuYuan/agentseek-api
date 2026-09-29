@@ -79,7 +79,7 @@ def _to_read_model(run: Run) -> RunRead:
         run_id=run.run_id,
         thread_id=run.thread_id,
         assistant_id=run.assistant_id,
-        status=run.status,
+        status="running" if run.status == "terminal_pending" else run.status,
         output=run.output_json,
         interrupts=interrupts,
         last_error=run.last_error,
@@ -651,7 +651,7 @@ async def list_runs(
     await _verify_thread_access(thread_id, user)
     query = select(Run).where(Run.thread_id == thread_id)
     if status is not None:
-        query = query.where(Run.status == status)
+        query = query.where(Run.status.in_(["running", "terminal_pending"]) if status == "running" else Run.status == status)
     query = query.order_by(Run.created_at.desc()).limit(limit).offset(offset)
     session_factory = db_manager.get_session_factory()
     async with session_factory() as session:

@@ -28,6 +28,7 @@ class FakeRedisCounter:
     def __init__(self) -> None:
         self.counts: dict[str, int] = {}
         self.streams: dict[str, list[tuple[str, dict[str, str]]]] = {}
+        self.operations: dict[str, list[object]] = {}
 
     async def incr(self, key: str) -> int:
         value = self.counts.get(key, 0) + 1
@@ -61,9 +62,15 @@ class FakeRedisCounter:
         return True
 
     async def eval(self, script: str, numkeys: int, *args: str) -> list[object]:
-        assert numkeys == 2
+        assert numkeys in {2, 3}
         assert "XADD" in script
-        seq_key, stream_key, encoded_payload, maxlen, ttl_seconds, event_prefix = args
+        operation_key = None
+        if numkeys == 3:
+            seq_key, stream_key, operation_key, encoded_payload, maxlen, ttl_seconds, event_prefix = args
+            if operation_key in self.operations:
+                return self.operations[operation_key]
+        else:
+            seq_key, stream_key, encoded_payload, maxlen, ttl_seconds, event_prefix = args
         seq = await self.incr(seq_key)
         payload = json.loads(encoded_payload)
         if event_prefix:
@@ -77,7 +84,10 @@ class FakeRedisCounter:
             approximate=True,
         )
         await self.expire(stream_key, int(ttl_seconds))
-        return [seq, encoded_event]
+        result = [seq, encoded_event]
+        if operation_key:
+            self.operations[operation_key] = result
+        return result
 
 
 def _parse_sse(stream_text: str) -> list[dict[str, object]]:

@@ -73,3 +73,122 @@ async def test_thread_stream_lua_splices_header_without_reencoding_payload(
     stored_event = json.loads(stored_payload)
     assert stored_event == event
     assert stored_payload == json.dumps(expected_event, ensure_ascii=False, separators=(",", ":"))
+
+
+@pytest.mark.parametrize("fault", ["before_xadd", "after_xadd", "lost_ack"])
+async def test_idempotent_envelope_repairs_runtime_failure(monkeypatch, fault):
+    redis = from_url(_TEST_REDIS_URL, decode_responses=True)
+    stream_id = uuid4().hex
+    operation = uuid4().hex
+    monkeypatch.setattr(stream_module, "_redis_client", redis)
+    original = stream_module._APPEND_REDIS_ENVELOPE_SCRIPT
+    injected = original
+    if fault == "before_xadd":
+        injected = original.replace("-- BEFORE_XADD", "error('injected before XADD')")
+    elif fault == "after_xadd":
+        injected = original.replace("-- AFTER_XADD", "error('injected after XADD')")
+    monkeypatch.setattr(stream_module, "_APPEND_REDIS_ENVELOPE_SCRIPT", injected)
+    kwargs = dict(scope="thread", stream_id=stream_id, operation_id=operation,
+                  payload={"method": "values", "params": {"data": []}})
+    try:
+        if fault != "lost_ack":
+            with pytest.raises(Exception, match="injected"):
+                await stream_module.append_redis_envelope(**kwargs)
+        else:
+            await stream_module.append_redis_envelope(**kwargs)  # Pretend response was lost.
+        monkeypatch.setattr(stream_module, "_APPEND_REDIS_ENVELOPE_SCRIPT", original)
+        # An unrelated writer may advance the stream after a failed reservation.
+        await stream_module.append_redis_envelope(scope="thread", stream_id=stream_id,
+            operation_id="other-" + operation, payload={"method": "values"})
+        first = await stream_module.append_redis_envelope(**kwargs)
+        assert await stream_module.append_redis_envelope(**kwargs) == first
+        rows = await redis.xrange(stream_module._thread_stream_key(stream_id))
+        assert len(rows) == 2
+        assert first[1]["params"]["data"] == []
+    finally:
+        keys = await redis.keys(f"*{stream_id}*")
+        if keys:
+            await redis.delete(*keys)
+        await redis.aclose()
+
+
+async def test_envelope_validates_wrong_type_before_counter_mutation(monkeypatch):
+    redis = from_url(_TEST_REDIS_URL, decode_responses=True)
+    stream_id = uuid4().hex
+    monkeypatch.setattr(stream_module, "_redis_client", redis)
+    key = stream_module._run_stream_key(stream_id)
+    try:
+        await redis.set(key, "wrong-type")
+        with pytest.raises(Exception, match="WRONGTYPE"):
+            await stream_module.append_redis_envelope(scope="run", stream_id=stream_id,
+                operation_id="test", payload={"event": "end"})
+        assert await redis.get(f"agentseek:runs:stream-seq:{stream_id}") is None
+    finally:
+        await redis.delete(key)
+        await redis.aclose()
+
+
+async def test_protocol_pair_reconciles_after_second_log_failure(run_storage, monkeypatch):
+    from agentseek_api.services import redis_delivery
+    redis = from_url(_TEST_REDIS_URL, decode_responses=True)
+    identity = uuid4().hex
+    monkeypatch.setattr(stream_module, "_redis_client", redis)
+    original = stream_module.append_redis_envelope
+    async def fail_thread(**kwargs):
+        if kwargs["scope"] == "thread":
+            raise RuntimeError("second log failed")
+        return await original(**kwargs)
+    monkeypatch.setattr(stream_module, "append_redis_envelope", fail_thread)
+    args = dict(operation_id=identity, run_id=identity, thread_id=identity,
+                payload={"method": "messages/partial", "params": {"data": {"tool_calls": []}}})
+    try:
+        with pytest.raises(RuntimeError, match="second log failed"):
+            await stream_module.append_redis_protocol_event(**args)
+        assert await redis.xlen(stream_module._run_stream_key(identity)) == 1
+        assert await redis.xlen(stream_module._thread_stream_key(identity)) == 0
+        monkeypatch.setattr(stream_module, "append_redis_envelope", original)
+        assert await redis_delivery.reconcile_protocol_deliveries() == 1
+        first = await stream_module.append_redis_protocol_event(**args)
+        assert await stream_module.append_redis_protocol_event(**args) == first
+        assert await redis.xlen(stream_module._run_stream_key(identity)) == 1
+        assert await redis.xlen(stream_module._thread_stream_key(identity)) == 1
+        assert first[1][1]["params"]["data"]["tool_calls"] == []
+    finally:
+        keys = await redis.keys(f"*{identity}*")
+        if keys:
+            await redis.delete(*keys)
+        await redis.aclose()
+
+
+async def test_pending_protocol_delivery_does_not_resurrect_deleted_run(run_storage, monkeypatch):
+    from agentseek_api.core.orm import Run
+    from agentseek_api.services import redis_delivery
+    redis = from_url(_TEST_REDIS_URL, decode_responses=True)
+    identity = uuid4().hex
+    monkeypatch.setattr(stream_module, "_redis_client", redis)
+    async with run_storage() as session:
+        session.add(Run(run_id=identity, thread_id="t1", assistant_id="a1", user_id="u1", status="running", execution_id="generation"))
+        await session.commit()
+    original = stream_module.append_redis_envelope
+    async def fail_thread(**kwargs):
+        if kwargs["scope"] == "thread":
+            raise RuntimeError("second log failed")
+        return await original(**kwargs)
+    monkeypatch.setattr(stream_module, "append_redis_envelope", fail_thread)
+    try:
+        with pytest.raises(RuntimeError):
+            await stream_module.append_redis_protocol_event(operation_id=identity, run_id=identity,
+                thread_id=identity, payload={"method": "values", "params": {"data": []}})
+        async with run_storage() as session:
+            await session.delete(await session.get(Run, identity))
+            await session.commit()
+        await redis.delete(stream_module._run_stream_key(identity))
+        monkeypatch.setattr(stream_module, "append_redis_envelope", original)
+        await redis_delivery.reconcile_protocol_deliveries()
+        assert await redis.xlen(stream_module._run_stream_key(identity)) == 0
+        assert await redis.xlen(stream_module._thread_stream_key(identity)) == 0
+    finally:
+        keys = await redis.keys(f"*{identity}*")
+        if keys:
+            await redis.delete(*keys)
+        await redis.aclose()

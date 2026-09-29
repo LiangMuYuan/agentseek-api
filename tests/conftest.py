@@ -6,6 +6,7 @@ from typing import Any
 from collections.abc import Awaitable, Callable
 
 import pytest
+import pytest_asyncio
 from fastapi import Request
 from fastapi.testclient import TestClient
 
@@ -14,6 +15,35 @@ from agentseek_api.main import create_app
 from agentseek_api.models.auth import User
 from agentseek_api.services.run_jobs import RunExecutionJob
 from agentseek_api.settings import settings
+
+
+@pytest_asyncio.fixture
+async def run_storage(tmp_path, monkeypatch):
+    """Real transaction boundary for run orchestration tests."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from agentseek_api.core.database import db_manager
+    from agentseek_api.core.orm import Assistant, Base, Thread
+    from agentseek_api.services import run_jobs, run_preparation, run_state, thread_protocol
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/run-storage.db")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(db_manager, "get_engine", lambda: engine)
+    monkeypatch.setattr(db_manager, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(settings, "EXECUTOR_BACKEND", "inline")
+    protocol = thread_protocol.ThreadProtocolEventBroker()
+    broker = run_state.RunEventBroker()
+    for module in (run_jobs, run_preparation, thread_protocol):
+        monkeypatch.setattr(module, "thread_protocol_broker", protocol)
+    for module in (run_jobs, run_preparation, run_state):
+        monkeypatch.setattr(module, "run_broker", broker)
+    async with factory() as session:
+        session.add(Thread(thread_id="t1", user_id="u1"))
+        session.add(Assistant(assistant_id="a1", name="Test", graph_id="default"))
+        await session.commit()
+    yield factory
+    await engine.dispose()
 
 
 class FakeCheckpointer:
@@ -42,6 +72,8 @@ class InlineExecutor:
             kwargs=job.kwargs,
             resume=job.resume,
             is_resume=job.is_resume,
+            execution_id=job.execution_id,
+            owns_accounting=job.owns_accounting,
         )
 
 
@@ -72,6 +104,8 @@ class BackgroundInlineExecutor:
                 kwargs=job.kwargs,
                 resume=job.resume,
                 is_resume=job.is_resume,
+                execution_id=job.execution_id,
+                owns_accounting=job.owns_accounting,
             )
         )
 
@@ -175,7 +209,7 @@ async def _midrun_reconnect_checks(client) -> None:
     assert last_id is not None
 
     status = await _wait_run_terminal(client, thread_id, run_id)
-    assert status == "success", status
+    assert status == "success", (await client.get(f"/threads/{thread_id}/runs/{run_id}")).json()
 
     # Phase 2: reconnect with Last-Event-ID.
     phase2 = await _collect_sse_frames(client, stream_url, headers={"Last-Event-ID": str(last_id)})

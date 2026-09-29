@@ -274,47 +274,45 @@ async def _persist_protocol_to_run_stream(run_id: str, payload: dict[str, Any]) 
 
 
 async def _apublish_thread_event(thread_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    run_id = (payload.get("params") or {}).get("run_id")
-    if settings.EXECUTOR_BACKEND.strip().lower() != "redis":
-        from agentseek_api.services.stream_persistence import buffer_durable_event
-        from agentseek_api.services.run_state import run_broker
+    from uuid import uuid4
+    from agentseek_api.services import stream_persistence as persistence
+    from agentseek_api.services.run_state import run_broker
+    from agentseek_api.services.transaction_retry import retry_transaction
 
-        if await buffer_durable_event(
+    run_id = (payload.get("params") or {}).get("run_id")
+    if settings.EXECUTOR_BACKEND.strip().lower() == "redis":
+        if run_id:
+            run_record, thread_record = await persistence.append_redis_protocol_event(
+                operation_id=str(uuid4()), run_id=run_id, thread_id=thread_id, payload=payload)
+            # Required dual writes are complete before either notification.
+            run_broker.publish_protocol(run_id, run_record[1], seq=run_record[0])
+            seq, saved = thread_record
+        else:
+            seq, saved = await persistence.append_redis_thread_stream_event(thread_id, payload)
+        return thread_protocol_broker.publish(thread_id, saved, persist=False, seq=seq)
+
+    buffer = persistence._stream_buffer.get()
+    if buffer is not None and buffer.thread_id == thread_id and (not run_id or buffer.run_id == run_id):
+        if await persistence.buffer_durable_event(
             "thread", thread_id, payload,
             lambda seq, saved: thread_protocol_broker.publish(thread_id, saved, persist=False, seq=seq),
         ):
             if run_id:
-                # Both records share the same SQL flush. No public sequence
-                # exists until that transaction commits.
-                await buffer_durable_event(
+                await persistence.buffer_durable_event(
                     "run", run_id, payload,
                     lambda seq, saved: run_broker.publish_protocol(run_id, saved, seq=seq),
                 )
             return dict(payload)
-    if run_id:
-        await _persist_protocol_to_run_stream(run_id, payload)
-    if settings.EXECUTOR_BACKEND.strip().lower() != "redis":
-        # Durable before expose: the thread event row (and its seq) is appended
-        # atomically first; the broker only records it after the append
-        # succeeded, so a client can never receive a seq that was not durably
-        # committed. ``_record_event`` never regresses below its in-memory
-        # watermark, keeping the wire seq monotonic across a cold broker.
-        from agentseek_api.services.stream_persistence import append_thread_stream_event_atomic
-
-        seq, _ = await append_thread_stream_event_atomic(thread_id, payload)
-        return thread_protocol_broker.publish(thread_id, payload, persist=False, seq=seq)
-    try:
-        from agentseek_api.services.stream_persistence import append_redis_thread_stream_event
-
-        seq, _ = await append_redis_thread_stream_event(thread_id, payload)
-    except Exception:
-        logger.warning(
-            "Failed to atomically append Redis thread stream event",
-            extra={"thread_id": thread_id},
-            exc_info=True,
-        )
-        seq = None
-    return thread_protocol_broker.publish(thread_id, payload, persist=False, seq=seq)
+    if not run_id:
+        seq, saved = await persistence.append_thread_stream_event_atomic(thread_id, payload)
+    else:
+        async def append_pair(session):
+            run_record = await persistence.add_run_stream_event_to_session(session, run_id, payload=payload)
+            thread_record = await persistence.add_thread_stream_event_to_session(session, thread_id, payload=payload)
+            return run_record, thread_record
+        run_record, (seq, saved) = await retry_transaction(append_pair)
+        run_broker.publish_protocol(run_id, run_record[1], seq=run_record[0])
+    return thread_protocol_broker.publish(thread_id, saved, persist=False, seq=seq)
 
 
 def publish_lifecycle_event(

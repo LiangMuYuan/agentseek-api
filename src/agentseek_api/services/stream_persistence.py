@@ -59,6 +59,89 @@ redis.call('EXPIRE', KEYS[2], ARGV[3])
 return {seq, payload}
 """
 
+# The operation marker is written BEFORE XADD. Lua execution is isolated but
+# runtime errors do not roll back earlier commands. A retry inspects the reserved
+# ID to distinguish a missing append from a committed append with a lost ack.
+_APPEND_REDIS_ENVELOPE_SCRIPT = """
+local expected = {'string', 'stream', 'hash'}
+for i = 1, 3 do
+  local actual = redis.call('TYPE', KEYS[i]).ok
+  if actual ~= 'none' and actual ~= expected[i] then
+    return redis.error_reply('WRONGTYPE stream envelope key')
+  end
+end
+local maxlen = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+if not maxlen or maxlen < 1 or not ttl or ttl < 1 or string.sub(ARGV[1], 1, 1) ~= '{' then
+  return redis.error_reply('Invalid stream envelope arguments')
+end
+local counter = redis.call('GET', KEYS[1])
+if counter and (not tonumber(counter) or tonumber(counter) < 0) then
+  return redis.error_reply('Invalid stream sequence counter')
+end
+local seq = redis.call('HGET', KEYS[3], 'seq')
+local payload = redis.call('HGET', KEYS[3], 'payload')
+if seq then
+  local rows = redis.call('XRANGE', KEYS[2], seq .. '-0', seq .. '-0')
+  if redis.call('HGET', KEYS[3], 'done') == '1' or #rows > 0 then
+    redis.call('HSET', KEYS[3], 'done', '1')
+    return {tonumber(seq), payload}
+  end
+end
+local last = redis.call('XREVRANGE', KEYS[2], '+', '-', 'COUNT', 1)
+local lastseq = 0
+if #last > 0 then lastseq = tonumber(string.match(last[1][1], '^(%d+)')) end
+seq = math.max(tonumber(counter) or 0, lastseq) + 1
+redis.call('SET', KEYS[1], tostring(seq))
+payload = ARGV[1]
+if ARGV[4] ~= '' then
+  local rest = string.sub(payload, 2)
+  local head = '{"type":"event","event_id":' .. cjson.encode(ARGV[4] .. ':' .. tostring(seq)) .. ',"seq":' .. tostring(seq)
+  if rest == '}' then payload = head .. '}' else payload = head .. ',' .. rest end
+end
+redis.call('HSET', KEYS[3], 'seq', tostring(seq), 'payload', payload)
+-- BEFORE_XADD
+redis.call('XADD', KEYS[2], 'MAXLEN', '~', maxlen, tostring(seq) .. '-0', 'payload', payload)
+-- AFTER_XADD
+redis.call('HSET', KEYS[3], 'done', '1')
+redis.call('EXPIRE', KEYS[2], ttl)
+return {seq, payload}
+"""
+
+
+def _operation_key(scope: str, stream_id: str, operation_id: str) -> str:
+    key = _run_stream_key(stream_id) if scope == "run" else _thread_stream_key(stream_id)
+    return f"{key}:op:{operation_id}"
+
+
+async def expire_redis_envelope(*, scope: str, stream_id: str, operation_id: str, **_kwargs) -> None:
+    await _get_redis_client().expire(_operation_key(scope, stream_id, operation_id), max(1, settings.REDIS_STREAM_TTL_SECONDS))
+
+
+async def append_redis_envelope(*, scope: str, stream_id: str, operation_id: str,
+                                payload: dict[str, Any], retain: bool = False) -> tuple[int, dict[str, Any]]:
+    if scope not in {"run", "thread"} or not operation_id:
+        raise ValueError("A stream scope and stable operation_id are required")
+    if scope == "thread":
+        payload = {k: v for k, v in payload.items() if k not in _THREAD_STREAM_ENVELOPE_FIELDS}
+    prefix = _RUN_STREAM_SEQ_KEY_PREFIX if scope == "run" else _THREAD_STREAM_SEQ_KEY_PREFIX
+    stream_key = _run_stream_key(stream_id) if scope == "run" else _thread_stream_key(stream_id)
+    result = await _get_redis_client().eval(
+        _APPEND_REDIS_ENVELOPE_SCRIPT, 3, f"{prefix}:{stream_id}", stream_key,
+        _operation_key(scope, stream_id, operation_id),
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        str(max(1, settings.REDIS_STREAM_MAXLEN)), str(max(1, settings.REDIS_STREAM_TTL_SECONDS)),
+        stream_id if scope == "thread" else "",
+    )
+    if not retain:
+        await expire_redis_envelope(scope=scope, stream_id=stream_id, operation_id=operation_id)
+    return int(result[0]), json.loads(result[1])
+
+
+async def append_redis_protocol_event(*, operation_id: str, run_id: str, thread_id: str, payload: dict[str, Any]):
+    from agentseek_api.services.redis_delivery import append_protocol_pair
+    return await append_protocol_pair(operation_id=operation_id, run_id=run_id, thread_id=thread_id, payload=payload)
+
 
 def _metadata_db_ready() -> bool:
     try:

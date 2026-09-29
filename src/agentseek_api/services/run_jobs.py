@@ -4,11 +4,9 @@ from dataclasses import dataclass, field
 import logging
 from typing import Any
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agentseek_api.core.database import db_manager
-from agentseek_api.core.orm import Run, Thread
+from agentseek_api.core.orm import Run
 from agentseek_api.settings import settings
 from agentseek_api.services.run_executor import RunExecutionResult, UNSET, execute_run
 from agentseek_api.services.run_state import run_broker
@@ -49,6 +47,10 @@ class RunExecutionJob:
     resume: Any | None = None
     is_resume: bool = False
     kind: str = RUN_EXECUTION_JOB_KIND
+    execution_id: str | None = None
+    owner_id: str | None = None
+    recover_running: bool = False
+    owns_accounting: bool = False
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -61,6 +63,7 @@ class RunExecutionJob:
             "graph_id": self.graph_id,
             "resume": self.resume if self.is_resume else None,
             "is_resume": self.is_resume,
+            "execution_id": self.execution_id,
         }
 
     @classmethod
@@ -78,6 +81,7 @@ class RunExecutionJob:
             resume=payload.get("resume"),
             is_resume=bool(payload.get("is_resume", False)),
             kind=kind,
+            execution_id=payload.get("execution_id"),
         )
 
 
@@ -150,15 +154,7 @@ async def _publish_run_event(
             return None
     if settings.EXECUTOR_BACKEND.strip().lower() == "redis":
         event_payload = {"event": event, **payload}
-        try:
-            seq, _ = await append_redis_run_stream_event(run_id, event_payload)
-        except Exception:
-            logger.warning(
-                "Failed to atomically append Redis run stream event",
-                extra={"run_id": run_id, "event": event},
-                exc_info=True,
-            )
-            seq = None
+        seq, _ = await append_redis_run_stream_event(run_id, event_payload)
         return run_broker.publish(run_id, event, seq=seq, **payload)
     seq, _ = await append_run_stream_event_atomic(run_id, {"event": event, **payload})
     return run_broker.publish(run_id, event, seq=seq, **payload)
@@ -196,44 +192,24 @@ def _apply_execution_result(db_run: Run, result: RunExecutionResult) -> None:
 
 
 async def execute_run_job(job: RunExecutionJob) -> None:
-    session_factory = db_manager.get_session_factory()
+    from uuid import uuid4
+    from agentseek_api.services.run_dispatch import claim_execution, execution_lease
+    from agentseek_api.services.terminal_delivery import TerminalResult, finish_run, _deliver_pending
+
     try:
-        async with session_factory() as execution_session:
-            db_run = await execution_session.scalar(select(Run).where(Run.run_id == job.run_id))
-            if db_run is None:
-                await _publish_lifecycle(
-                    job.thread_id,
-                    event="failed",
-                    graph_name=job.graph_id,
-                    error="Run was deleted before execution started",
-                )
-                return
-            if _is_cancelled_run(db_run):
-                await _publish_lifecycle(
-                    job.thread_id,
-                    event="failed",
-                    graph_name=job.graph_id,
-                    error=db_run.last_error,
-                )
-                return
-            if db_run.status in TERMINAL_RUN_STATUSES:
-                return
-
-            db_run.status = "running"
-            db_run.last_error = None
-            thread = await execution_session.scalar(select(Thread).where(Thread.thread_id == job.thread_id))
-            if thread is not None:
-                thread.status = "busy"
-                thread.state_updated_at = db_run.updated_at
-            await execution_session.commit()
-            await _publish_run_event(job.run_id, "start")
-
+        claim = await claim_execution(job, owner_id=job.owner_id or str(uuid4()), recovered=job.recover_running)
+        if claim == "terminal_pending":
+            await _deliver_pending(job.run_id, job.execution_id or job.run_id)
+            return
+        if claim != "claimed":
+            return
+        async with execution_lease(job):
             try:
+                # Start append belongs to the same compensation boundary as the graph.
+                await _publish_run_event(job.run_id, "start")
                 execute_kwargs = {
-                    "thread_id": job.thread_id,
-                    "run_id": job.run_id,
-                    "payload": job.payload,
-                    "user_id": job.user_id,
+                    "thread_id": job.thread_id, "run_id": job.run_id,
+                    "payload": job.payload, "user_id": job.user_id,
                     "graph_id": job.graph_id,
                     "resume": job.resume if job.is_resume else UNSET,
                 }
@@ -241,56 +217,23 @@ async def execute_run_job(job: RunExecutionJob) -> None:
                     execute_kwargs["kwargs"] = job.kwargs
                 async with buffered_stream_persistence(run_id=job.run_id, thread_id=job.thread_id):
                     result = await execute_run(**execute_kwargs)
-                await _persist_thread_snapshot(job.thread_id)
-                await execution_session.refresh(db_run)
-                if not _is_cancelled_run(db_run):
-                    # A missing checkpoint lookup should not turn a successful run into a failed one.
-                    try:
-                        latest_checkpoint = await get_latest_checkpoint(job.thread_id)
-                    except Exception:  # noqa: BLE001
-                        latest_checkpoint = None
+                metadata = {}
+                try:
+                    latest_checkpoint = await get_latest_checkpoint(job.thread_id)
                     if latest_checkpoint is not None:
-                        checkpoint_id = checkpoint_to_payload(latest_checkpoint)["checkpoint"]["checkpoint_id"]
-                        db_run.metadata_json = {
-                            **(db_run.metadata_json or {}),
-                            RUN_CHECKPOINT_ID_METADATA_KEY: checkpoint_id,
-                        }
-                    _apply_execution_result(db_run, result)
-            except Exception as exc:  # noqa: BLE001
-                await execution_session.refresh(db_run)
-                if not _is_cancelled_run(db_run):
-                    db_run.status = "error"
-                    db_run.last_error = f"{type(exc).__name__}: {exc}"
-
-            thread = await execution_session.scalar(select(Thread).where(Thread.thread_id == job.thread_id))
-            if thread is not None:
-                thread.status = "interrupted" if db_run.status == "interrupted" else ("error" if db_run.status == "error" else "idle")
-                thread.state_updated_at = db_run.updated_at
-            is_redis_executor = settings.EXECUTOR_BACKEND.strip().lower() == "redis"
-            terminal = await _publish_terminal_run_event(execution_session, job.run_id, status=db_run.status)
-            lifecycle_state = "completed"
-            if db_run.status == "interrupted":
-                lifecycle_state = "interrupted"
-            elif db_run.status == "error":
-                lifecycle_state = "failed"
-            lifecycle = await _publish_lifecycle(
-                job.thread_id,
-                event=lifecycle_state,
-                graph_name=job.graph_id,
-                error=db_run.last_error,
-                session=execution_session,
-            )
-            await execution_session.commit()
-            if not is_redis_executor and terminal is not None and lifecycle is not None:
-                # The terminal records are durable with the run state now; only
-                # then expose them to the in-memory brokers, so a client never
-                # sees a seq that was not durably committed.
-                run_broker.publish(job.run_id, "end", seq=terminal[0], status=db_run.status)
-                thread_protocol_broker.publish(
-                    job.thread_id,
-                    lifecycle[1],
-                    persist=False,
-                    seq=lifecycle[0],
+                        metadata[RUN_CHECKPOINT_ID_METADATA_KEY] = checkpoint_to_payload(latest_checkpoint)["checkpoint"]["checkpoint_id"]
+                except Exception:
+                    logger.debug("Checkpoint metadata unavailable", exc_info=True)
+                terminal = TerminalResult(
+                    status="interrupted" if result.interrupted else "success",
+                    output=result.output, metadata=metadata,
                 )
+            except Exception as exc:
+                terminal = TerminalResult(status="error", error=f"{type(exc).__name__}: {exc}")
+            # Failure here deliberately leaves a recoverable lease/pending result.
+            # Do not turn a completed graph into another execution on delivery retry.
+        await finish_run(job, terminal)
     finally:
-        thread_protocol_broker.run_finished(job.thread_id)
+        if job.owns_accounting:
+            job.owns_accounting = False
+            thread_protocol_broker.run_finished(job.thread_id)

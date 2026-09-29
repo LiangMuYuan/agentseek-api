@@ -13,6 +13,8 @@ from agentseek_api.services.run_executor import (
 )
 from agentseek_api.services.thread_protocol import ThreadProtocolEventBroker
 
+pytestmark = pytest.mark.usefixtures("run_storage")
+
 
 class FakeGraph:
     """Fake compiled graph: the default path streams through ``astream()`` and

@@ -2,7 +2,7 @@
 
 [English](README.md) | **中文**
 
-[![PyPI version](https://img.shields.io/pypi/v/agentseek-api.svg)](https://pypi.org/project/agentseek-api/) [![Python >=3.12](https://img.shields.io/badge/python-%3E%3D3.12-blue.svg)](https://pypi.org/project/agentseek-api/) [![CI](https://github.com/ob-labs/agentseek-api/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ob-labs/agentseek-api/actions/workflows/ci.yml?query=branch%3Amain)
+[![PyPI version](https://img.shields.io/pypi/v/agentseek-api.svg)](https://pypi.org/project/agentseek-api/) [![Python 3.12-3.13](https://img.shields.io/badge/python-3.12--3.13-blue.svg)](https://pypi.org/project/agentseek-api/) [![CI](https://github.com/ob-labs/agentseek-api/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ob-labs/agentseek-api/actions/workflows/ci.yml?query=branch%3Amain)
 
 > [!WARNING]
 > 本项目正在积极开发中，**尚未达到生产可用状态**。
@@ -32,7 +32,7 @@
 
 ### 前置条件
 
-- Python 3.12+
+- Python >=3.12,<3.14
 - `uv`
 
 ### 选择合适的本地开发循环
@@ -80,7 +80,7 @@ uv sync --extra embedded
 
 ### 2. 将 seekdb embed 配置为默认后端（推荐）
 
-最快获得真实后端的方式是 **seekdb embed** — 一个进程内嵌入式 SeekDB 实例，
+最快获得真实后端的方式是 **seekdb embed** — 一个进程内嵌入式 seekdb 实例，
 无需 Docker 或独立进程：
 
 ```bash
@@ -181,7 +181,7 @@ uv run agentseek-api dev --config ./langgraph.json
 ╠═╣│ ┬├┤ │││ │ ╚═╗├┤ ├┤ ├┴┐
 ╩ ╩└─┘└─┘┘└┘ ┴ ╚═╝└─┘└─┘┴ ┴
 
-     AgentSeek v0.2.1
+     AgentSeek v0.2.3
 
 - 🚀 API: http://localhost:2024
 - 📚 Docs: http://localhost:2024/docs
@@ -262,7 +262,7 @@ agentseek-api <command> [arguments]
 uv run agentseek-api dev
 uv run agentseek-api serve --config ./langgraph.json --port 8080
 uv run agentseek-api worker --config ./langgraph.json
-uv run agentseek-api dockerfile --config ./langgraph.json ./Dockerfile.agentseek
+uv run agentseek-api dockerfile --config ./langgraph.json ./agentseek-build-bundle
 uv run agentseek-api build --config ./langgraph.json -t agentseek-api:dev
 uv run agentseek-api up --config ./langgraph.json --port 8123 --wait
 uv run agentseek-api version
@@ -289,9 +289,17 @@ uv run agentseek-api version
 - `build`
   - 使用 `-t, --tag` 设置镜像 tag
   - 支持 `--platform`、`--pull`、`--no-pull`
+- `dockerfile`
+  - 输出完整的私有构建 bundle 目录，其中包含生成的 `Dockerfile`、净化后的
+    runtime manifest 与选中的项目文件；输出参数必须是新目录，而不是单个
+    Dockerfile 文件路径
 - `up`
   - 支持 `--wait`、`--image`、`--base-image`、`--postgres-uri`、
     `--recreate`、`--no-recreate`
+  - `--pass-env NAME` 显式选择一个已解析的应用变量，通过名称继承方式交给
+    直接 Docker carrier，变量值不会进入 argv
+  - `--compose-pass-env NAME` 显式选择一个已解析的应用变量交给 Compose；
+    配置文件中的 `compose_env` 提供同样的选择能力
 
 部分仿照 LangGraph CLI 的参数会为了命令兼容性被解析，但当对应运行时
 行为还未实现时会被直接拒绝。对于 mock、内存或 tunnel 化的本地工作流，
@@ -371,11 +379,40 @@ Redis 实例同时运行。
 - `http.disable_a2a`：关闭 A2A 端点及 agent-card 发现路由
 - `base_image`、`python_version`、`image_distro`、`pip_config_file`、
   `dockerfile_lines`：Docker 构建自定义字段
+- `build_include`：额外复制到净化构建 bundle 中的受信任普通文件或目录树
+- `compose_env`：允许通过显式 Compose dotenv carrier 的、已完成解析的应用
+  环境变量名称
+
+### 0.3.0 引入的容器契约
+
+`preloaded-v1` 是不兼容旧行为、失败即关闭的容器边界。宿主机只解析一次
+应用配置。从生成镜像启动的容器只接收显式选择的运行时 payload；宿主机环境、dotenv
+文件、包仓库凭证和未选择的 Compose 值都不会进入构建上下文或镜像层。
+`--pass-env` 与 `--compose-pass-env` 只应接收可信输入：它们授权变量跨越指定
+运行时边界，并不允许变量进入镜像构建。
+
+`build_include` 同样属于可信输入声明，必须审查每条路径。带凭证的 Python
+仓库配置应使用 `pip_config_file`，CLI 会将其作为 BuildKit pip secret 挂载，
+不会复制到上下文。`dockerfile` 命令现在输出 Docker 实际消费的完整 bundle
+目录，而不是单独的 Dockerfile。
+
+自定义镜像必须提供以下四个精确标签：
+
+- `org.agentseek.environment-contract=preloaded-v1`
+- `org.agentseek.runtime-manifest=/opt/agentseek/manifest.v1.json`
+- `org.agentseek.runtime-distribution=agentseek-api`
+- `org.agentseek.runtime-version=0.3.2`
+
+manifest、已安装 distribution、entrypoint 与标签必须一致。系统不提供旧镜像
+回退：传给 `up --image` 前必须完成迁移与校验；否则应继续用旧 launcher 配合
+旧镜像。Train A 已达成版本为 API 0.2.3、templates 0.1.3、AgentSeek 0.1.3；
+后续 Train B 的 template/catalog 计划单独发布 0.1.4。AgentSeek 也计划另行发布
+0.1.4；两者都基于已经发布的 0.1.3。
 
 CLI 层会尽量容忍 LangGraph 在端点级别使用的配置键，例如 `http` 与
 `api_version`。Store 配置会被 HTTP Store API 以及注入的 LangGraph
 `BaseStore` 运行时用于 TTL 与语义检索。本仓库使用 PyPI 上发布的
-`langchain-oceanbase==0.5.2` 包。
+`langchain-oceanbase>=0.6.4,<0.7` 包。
 
 配置驱动的自定义鉴权可以放在 `agentseek.json` 或 `langgraph.json` 中：
 
@@ -623,7 +660,12 @@ parent api build --config ./langgraph.json -t my-api:dev
 - `METADATA_DB_BACKEND=auto` 会对驱动进行归一化：
   - PostgreSQL：`postgresql+asyncpg://...`
   - OceanBase / MySQL：`mysql+aiomysql://...`
-- Checkpoint 持久化默认使用 OceanBase / seekdb 配置
+  - SQLite：`sqlite+aiosqlite://...`
+- 完成态 run 快照默认使用 OceanBase / seekdb 配置。当
+  `METADATA_DB_BACKEND=sqlite` 时，快照会写入已配置的 SQLite 元数据
+  数据库，且不会构造 OceanBase saver。
+- SQLite 元数据路径仍使用内存中的 LangGraph checkpointer，不提供持久化的
+  LangGraph 图 checkpoint。
 - 鉴权：通过 `agentseek.json` 的 `"auth.path"` 或 `AUTH_MODULE_PATH` 环境变量配置。
   使用 `langgraph_sdk.Auth` 的 `@auth.authenticate` 与 `@auth.on` 处理器风格。
   未配置时所有请求以 default_user 放行（noop）。

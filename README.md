@@ -2,7 +2,7 @@
 
 **English** | [中文](README.zh-CN.md)
 
-[![PyPI version](https://img.shields.io/pypi/v/agentseek-api.svg)](https://pypi.org/project/agentseek-api/) [![Python >=3.12](https://img.shields.io/badge/python-%3E%3D3.12-blue.svg)](https://pypi.org/project/agentseek-api/) [![CI](https://github.com/ob-labs/agentseek-api/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ob-labs/agentseek-api/actions/workflows/ci.yml?query=branch%3Amain)
+[![PyPI version](https://img.shields.io/pypi/v/agentseek-api.svg)](https://pypi.org/project/agentseek-api/) [![Python 3.12-3.13](https://img.shields.io/badge/python-3.12--3.13-blue.svg)](https://pypi.org/project/agentseek-api/) [![CI](https://github.com/ob-labs/agentseek-api/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ob-labs/agentseek-api/actions/workflows/ci.yml?query=branch%3Amain)
 
 > [!WARNING]
 > This project is under active development and is **not production-ready**.
@@ -33,7 +33,7 @@ Current release boundary:
 
 ### Prerequisites
 
-- Python 3.12+
+- Python >=3.12,<3.14
 - `uv`
 
 ### Choose the right local loop
@@ -83,7 +83,7 @@ uv sync --extra embedded
 ### 2. Configure seekdb embed as the default backend (recommended)
 
 The fastest way to get a real backend running locally is **seekdb embed** — an
-in-process SeekDB instance, no Docker or separate process required:
+in-process seekdb instance, no Docker or separate process required:
 
 ```bash
 SEEKDB_EMBED=true agentseek-api dev
@@ -185,7 +185,7 @@ When the server starts it prints the banner and local URLs:
 ╠═╣│ ┬├┤ │││ │ ╚═╗├┤ ├┤ ├┴┐
 ╩ ╩└─┘└─┘┘└┘ ┴ ╚═╝└─┘└─┘┴ ┴
 
-     AgentSeek v0.2.1
+     AgentSeek v0.2.3
 
 - 🚀 API: http://localhost:2024
 - 📚 Docs: http://localhost:2024/docs
@@ -260,7 +260,35 @@ When running from this repository, use `uv run agentseek-api ...`.
 
 - `-c, --config PATH`: explicit `agentseek.json`, `langgraph.json`, or manifest
   path
-- `--env-file PATH`: dotenv-style file loaded into the runtime environment
+- `--env-file PATH`: host-runtime dotenv source
+
+### Host runtime environment
+
+For `dev`, `serve`, `worker`, and `scheduler`, direct assignments are applied in
+this order:
+
+1. the dotenv path named by config `env`;
+2. the literal config `env` mapping and `auth.path`;
+3. the CLI `--env-file`;
+4. the environment inherited by `agentseek-api`.
+
+The inherited environment is authoritative by key presence. This includes an
+explicit empty value. A lower source can fill an absent key, but cannot replace
+an inherited `KEY=`.
+
+Each dotenv file is evaluated independently. It can reference the inherited
+environment and earlier bindings in the same physical file; it cannot reference
+a config mapping or another dotenv file. Later assignment does not recompute an
+earlier interpolated value.
+
+In dotenv syntax, a bare `KEY` is valid but contributes no assignment, while
+`KEY=` contributes an explicit empty string. Missing files, invalid UTF-8, and
+malformed syntax stop the command before a runtime child starts.
+
+The CLI applies command-owned values after this merge: the selected config path
+becomes `AGENTSEEK_GRAPHS`, and `dev` forces `STUDIO_AUTH_LOCAL_DEV=true`.
+Host and port options are passed as child argv and do not rewrite environment
+keys with similar names.
 
 ### Common usage
 
@@ -268,7 +296,7 @@ When running from this repository, use `uv run agentseek-api ...`.
 uv run agentseek-api dev
 uv run agentseek-api serve --config ./langgraph.json --port 8080
 uv run agentseek-api worker --config ./langgraph.json
-uv run agentseek-api dockerfile --config ./langgraph.json ./Dockerfile.agentseek
+uv run agentseek-api dockerfile --config ./langgraph.json ./agentseek-build-bundle
 uv run agentseek-api build --config ./langgraph.json -t agentseek-api:dev
 uv run agentseek-api up --config ./langgraph.json --port 8123 --wait
 uv run agentseek-api version
@@ -295,9 +323,18 @@ uv run agentseek-api version
 - `build`
   - Use `-t, --tag` to set the image tag
   - Supports `--platform`, `--pull`, and `--no-pull`
+- `dockerfile`
+  - Writes a complete private build-bundle directory, including the generated
+    `Dockerfile`, sanitized runtime manifest, and selected project files; the
+    output argument is a new directory, not a standalone Dockerfile path
 - `up`
   - Supports `--wait`, `--image`, `--base-image`, `--postgres-uri`,
     `--recreate`, and `--no-recreate`
+  - `--pass-env NAME` explicitly selects a resolved application value for the
+    direct Docker carrier; the value is inherited by name and never put in argv
+  - `--compose-pass-env NAME` explicitly selects a resolved application value
+    for Compose interpolation; config can make the same selection with
+    `compose_env`
 
 Some LangGraph CLI-shaped flags are parsed for command compatibility but
 rejected when their runtime behavior is not implemented yet. For mocked,
@@ -376,11 +413,45 @@ Useful config fields:
 - `http.disable_a2a`: disable the A2A endpoint and agent-card discovery route
 - `base_image`, `python_version`, `image_distro`, `pip_config_file`,
   `dockerfile_lines`: Docker build customization fields
+- `build_include`: additional trusted regular files or directory trees to copy
+  into the sanitized build bundle
+- `compose_env`: names from the already-resolved application environment that
+  may cross into an explicitly selected Compose dotenv carrier
+
+### Container contract introduced in 0.3.0
+
+The `preloaded-v1` contract is a breaking, fail-closed container boundary. The
+host resolves application configuration once. Containers started from generated images receive only
+the selected runtime payload, while ambient host values, dotenv files, package
+credentials, and unselected Compose values stay outside the build context and
+image layers. Use `--pass-env` or `--compose-pass-env` only for trusted input;
+these flags authorize a value to cross the named runtime boundary, not to enter
+the build.
+
+`build_include` is also a trusted-input declaration: review every selected path.
+Credentialed Python indexes belong in `pip_config_file`, which is mounted as a
+BuildKit pip secret and is not copied into the context. The `dockerfile` command
+now writes the complete bundle directory consumed by Docker rather than a lone
+Dockerfile.
+
+Custom images must expose all four exact labels:
+
+- `org.agentseek.environment-contract=preloaded-v1`
+- `org.agentseek.runtime-manifest=/opt/agentseek/manifest.v1.json`
+- `org.agentseek.runtime-distribution=agentseek-api`
+- `org.agentseek.runtime-version=0.3.2`
+
+The manifest, installed distribution, entrypoint, and labels must agree. There
+is no legacy-image fallback: migrate and attest the image before passing it to
+`up --image`, or keep using the older launcher with the older image. Release
+Train A coordinates are API 0.2.3, templates 0.1.3, and AgentSeek 0.1.3; the
+The planned Train B template/catalog release is 0.1.4. The separate planned
+AgentSeek release is also 0.1.4; both follow the shipped 0.1.3 releases.
 
 Endpoint-level LangGraph config keys such as `http` and `api_version` are
 tolerated by the CLI layer where possible. Store config is used by the HTTP
 Store API and the injected LangGraph `BaseStore` runtime for TTL and semantic
-search. This repo uses the published `langchain-oceanbase==0.5.2` package from
+search. This repo uses the published `langchain-oceanbase>=0.6.4,<0.7` package from
 PyPI.
 
 Config-driven custom auth can live in `agentseek.json` or `langgraph.json`:
@@ -631,7 +702,12 @@ parent api build --config ./langgraph.json -t my-api:dev
 - `METADATA_DB_BACKEND=auto` normalizes drivers:
   - PostgreSQL: `postgresql+asyncpg://...`
   - OceanBase / MySQL: `mysql+aiomysql://...`
-- Checkpoint persistence defaults to OceanBase / seekdb settings
+  - SQLite: `sqlite+aiosqlite://...`
+- Completed-run snapshots default to OceanBase / seekdb settings. With
+  `METADATA_DB_BACKEND=sqlite`, they are stored in the configured SQLite
+  metadata database without constructing an OceanBase saver.
+- The SQLite metadata path still uses an in-memory LangGraph checkpointer; it
+  does not make LangGraph graph checkpoints durable.
 - Auth: configure via `agentseek.json` `"auth.path"` or `AUTH_MODULE_PATH` env var.
   Uses `langgraph_sdk.Auth` with `@auth.authenticate` and `@auth.on` handlers.
   If not set, all requests pass through as default_user (noop).
@@ -640,6 +716,23 @@ parent api build --config ./langgraph.json -t my-api:dev
 
 ### Durable execution
 
+- Inline mode publishes live stream events in memory immediately and batches
+  their SQL persistence per run. Batches flush at 128 events or 1 MiB of
+  serialized payloads, periodically after about 100 ms, and when execution
+  ends. Slow writes apply backpressure instead of growing the buffer without
+  bounds; an oversized event is written alone.
+- Pending inline events are drained before terminal events are published,
+  including when graph execution fails or is cancelled. SQL stream persistence
+  remains best effort on database failures. An abrupt process failure can lose
+  the unflushed event tail; completed-run checkpoints are saved separately.
+- To compare persistence overhead locally, run
+  [`scripts/benchmark_stream_persistence.py`](scripts/benchmark_stream_persistence.py).
+  It exercises the real API with temporary SQLite storage or native embedded
+  seekdb (`--backend embedded`), checks output/checkpoints/replay, and makes no
+  model-provider calls. SQL latency injection is optional. Use `--repeat` for
+  median/maximum timings; embedded CI also enforces SQL operation budgets.
+  See the [embedded performance report](docs/performance/embedded-seekdb-performance.md)
+  for measured latency, backend details, and reproduction commands.
 - Redis mode stores run stream events and protocol stream events in bounded
   Redis Streams, so replay does not depend on API-process memory and streaming
   writes do not put the metadata database on the hot path.

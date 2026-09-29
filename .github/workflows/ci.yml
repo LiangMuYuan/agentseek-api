@@ -44,7 +44,13 @@ jobs:
         run: uv sync --dev
 
       - name: Coverage-backed unit + integration suite
-        run: make test-cov
+        run: >-
+          uv run pytest tests/unit tests/integration
+          -m 'not docker'
+          --cov=src/agentseek_api
+          --cov-report=term-missing
+          --cov-fail-under=90
+          -q
 
   cli-compatibility:
     name: CLI Compatibility (${{ matrix.os }})
@@ -78,11 +84,25 @@ jobs:
         run: uv run python scripts/test_cli_config_autodiscovery.py
 
       - name: Dockerfile command renders a runnable config
-        run: >-
-          uv run python -c
-          "from pathlib import Path; import subprocess; out = Path('.tmp/agentseek.Dockerfile'); out.parent.mkdir(exist_ok=True); subprocess.run(['uv', 'run', 'agentseek-api', 'dockerfile', '--config', 'examples/external_graph/manifest.json', str(out)], check=True); text = out.read_text(encoding='utf-8'); assert 'ENV PYTHONPATH=/deps/agent' in text; assert 'ENV AGENTSEEK_GRAPHS=/deps/agent/examples/external_graph/manifest.json' in text"
+        run: uv run python scripts/test_cli_config_autodiscovery.py --config examples/external_graph/manifest.json
 
-      - name: Sync embedded SeekDB extra for serve smoke
+      - name: CLI config, host environment, and process tests
+        run: >-
+          uv run pytest
+          tests/unit/test_cli.py
+          tests/unit/test_graph_manifest.py
+          tests/unit/test_dotenv_adapter.py
+          tests/unit/test_runtime_environment.py
+          tests/unit/test_runtime_entrypoint.py
+          tests/unit/test_process_supervisor.py
+          tests/unit/test_sqlite_checkpointer.py
+          tests/unit/test_container_policy.py
+          tests/unit/test_secure_temp.py
+          tests/integration/test_cli_runtime_processes.py
+          tests/integration/test_metadata_db_config.py
+          -q
+
+      - name: Sync embedded seekdb extra for serve smoke
         if: runner.os == 'Linux' || (runner.os == 'macOS' && runner.arch == 'ARM64')
         run: uv sync --dev --extra embedded
 
@@ -90,11 +110,12 @@ jobs:
         if: runner.os == 'Linux' || (runner.os == 'macOS' && runner.arch == 'ARM64')
         run: uv run python scripts/test_cli_serve_smoke.py
 
-      - name: CLI config and Docker planning tests
-        run: uv run pytest tests/unit/test_cli.py tests/unit/test_graph_manifest.py -q
+      - name: Minimum direct dependency compatibility
+        if: runner.os == 'Linux'
+        run: uv run python scripts/test_minimum_cli_dependencies.py
 
   embedded-seekdb-smoke:
-    name: Embedded SeekDB Smoke
+    name: Embedded seekdb Smoke
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -114,10 +135,46 @@ jobs:
       - name: Embedded seekdb serve smoke (SEEKDB_EMBED=true)
         run: uv run python scripts/test_cli_embed_serve_smoke.py
 
+      - name: Embedded seekdb stream persistence performance and replay
+        env:
+          PYTHONPATH: src
+        run: |
+          # Shared runners get timing headroom; SQL budgets catch both live
+          # writes and final history rechecks independently of host speed.
+          uv run python scripts/benchmark_stream_persistence.py \
+            --backend embedded --repeat 3 --messages 38 \
+            --max-api-seconds 3 --max-finalization-seconds 1 \
+            --max-metadata-commits 16 --max-snapshot-selects 1 \
+            --output /tmp/embedded-fresh.json
+          uv run python scripts/benchmark_stream_persistence.py \
+            --backend embedded --repeat 3 --messages 0 --history 38 \
+            --max-api-seconds 3 --max-finalization-seconds 1 \
+            --max-metadata-commits 16 --max-snapshot-selects 1 \
+            --output /tmp/embedded-history.json
+          uv run python scripts/benchmark_stream_persistence.py \
+            --backend embedded --repeat 3 --messages 128 \
+            --max-api-seconds 3 --max-finalization-seconds 1 \
+            --max-metadata-commits 24 --max-snapshot-selects 2 \
+            --output /tmp/embedded-larger.json
+
+      - name: Upload embedded seekdb performance measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: embedded-seekdb-performance
+          path: /tmp/embedded-*.json
+          if-no-files-found: ignore
+
   cli-docker-runtime:
-    name: CLI Docker Runtime
+    name: CLI Docker Runtime (Compose ${{ matrix.compose-version }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        compose-version:
+          - runner-current
+          - v2.24.0
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -131,6 +188,21 @@ jobs:
 
       - name: Sync dependencies
         run: uv sync --dev
+
+      - name: Install Compose floor
+        if: matrix.compose-version == 'v2.24.0'
+        uses: docker/setup-compose-action@2fe291b7677a45ee1269ec56a42604c143505e7e # v1
+        with:
+          version: v2.24.0
+
+      - name: Record Compose version
+        run: docker compose version --short
+
+      - name: Container environment boundary
+        run: uv run python scripts/test_container_env_boundary.py
+
+      - name: Docker and Compose regression suite
+        run: uv run pytest tests/unit/test_docker_runtime.py -m docker -q
 
       - name: CLI Docker smoke
         run: make test-cli-docker
